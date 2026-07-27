@@ -750,6 +750,24 @@ with tab3:
 
     # v3.5 — visible scheduler status + last-runs table + diagnostics
     with st.expander("⚙ Gmail scan status & recent history", expanded=False):
+        # Compact the three status metrics inside THIS expander only.
+        # Without the div[data-testid="stExpander"] prefix, this would
+        # shrink every st.metric across every tab.
+        st.markdown("""
+        <style>
+          div[data-testid="stExpander"] div[data-testid="stMetric"] label {
+              font-size: 10px !important;
+              color: #8a8880 !important;
+          }
+          div[data-testid="stExpander"] div[data-testid="stMetricValue"] {
+              font-size: 15px !important;
+          }
+          div[data-testid="stExpander"] div[data-testid="stMetricValue"] > div {
+              font-size: 15px !important;
+          }
+        </style>
+        """, unsafe_allow_html=True)
+
         # Show startup error first, if any — this is what was silently
         # hidden before and led to "🔴 idle" with no explanation.
         if st.session_state.get("_scheduler_error"):
