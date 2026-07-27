@@ -61,16 +61,51 @@ def _kpi(col, label: str, value: str, help_text: str, delta: str | None = None):
 
 def _auto_load_if_needed():
     """Silent initial load: if the DB has zero invoices but the workbook is
-    present, push it in. Runs at most once per session."""
+    present, push it in. Runs at most once per session.
+
+    v3.5.1: made resilient to two Streamlit-Cloud-specific edge cases —
+    (a) DB file exists but the `invoices` table hasn't been created yet
+        (fresh SQLite in an ephemeral filesystem), and
+    (b) workbook path is set but the file itself isn't there
+        (deployed without the stub demo).
+    Either now shows a friendly warning instead of crashing.
+    """
     if st.session_state.get("_auto_load_done"):
         return
-    if not Path(XLSX_PATH).exists():
+
+    workbook_present = Path(XLSX_PATH).exists()
+
+    if not workbook_present:
+        st.warning(
+            f"📄 Sales workbook not found at `{XLSX_PATH}`.\n\n"
+            "The dashboard needs the invoice data to compute KPIs. "
+            "If you're running on Streamlit Cloud, add a stub workbook "
+            "to `data/` in the repo (see docs/DEPLOYMENT.md), or update "
+            "the `SALES_XLSX` secret to point to a file that exists."
+        )
+        st.session_state["_auto_load_done"] = True
         return
-    with get_db(DB_PATH) as conn:
-        n = conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0]
+
+    # Both file and DB exist — check whether the initial load has run.
+    # `invoices` table might not exist yet on a fresh DB, so tolerate that.
+    try:
+        with get_db(DB_PATH) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM invoices").fetchone()
+            n = row[0] if row else 0
+    except Exception:
+        # Table doesn't exist yet — treat as an empty DB, initial load
+        # will create it.
+        n = 0
+
     if n == 0:
-        with st.spinner("First-time load: importing invoices from the workbook…"):
-            import_initial_load()
+        try:
+            with st.spinner("First-time load: importing invoices from the workbook…"):
+                import_initial_load()
+        except Exception as e:
+            st.error(
+                f"Initial load from `{XLSX_PATH}` failed: {e}\n\n"
+                "The dashboard will show empty panels until this is fixed."
+            )
     st.session_state["_auto_load_done"] = True
 
 
