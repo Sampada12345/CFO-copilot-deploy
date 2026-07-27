@@ -63,14 +63,29 @@ def _auto_load_if_needed():
     """Silent initial load: if the DB has zero invoices but the workbook is
     present, push it in. Runs at most once per session.
 
-    v3.5.1: made resilient to two Streamlit-Cloud-specific edge cases —
-    (a) DB file exists but the `invoices` table hasn't been created yet
+    v3.5.2: also calls init_db() up-front to guarantee every table exists.
+    Locally this is a no-op (tables were created on your first run months
+    ago). On Streamlit Cloud the ephemeral filesystem gives a fresh empty
+    .db file after every restart, so the schema really does need to be
+    (re-)created before anything else touches the DB.
+
+    Made resilient to two Streamlit-Cloud-specific edge cases:
+    (a) DB file exists but tables haven't been created yet
         (fresh SQLite in an ephemeral filesystem), and
     (b) workbook path is set but the file itself isn't there
         (deployed without the stub demo).
     Either now shows a friendly warning instead of crashing.
     """
     if st.session_state.get("_auto_load_done"):
+        return
+
+    # Ensure schema exists — cheap no-op if the tables are already there.
+    try:
+        from core.database import init_db
+        init_db(DB_PATH)
+    except Exception as e:
+        st.error(f"Database initialisation failed: {e}")
+        st.session_state["_auto_load_done"] = True
         return
 
     workbook_present = Path(XLSX_PATH).exists()
