@@ -76,8 +76,18 @@ PROCESSED_LABEL_NAME = "InvoiceAgent/Processed"
 def get_gmail_service():
     """
     Authenticates with Gmail and returns a service object.
-    First run: opens browser for login consent.
-    Later runs: uses saved token.json automatically.
+
+    Credential resolution order (so it works identically local + cloud):
+      1. If GMAIL_TOKEN_B64 is set (Streamlit Cloud) → decode the pickled
+         token from that base64 env var, in memory. No file needed.
+      2. Else if a token file exists on disk (local) → load it.
+      3. If no valid token → refresh it, or run the browser OAuth flow
+         (local only — the browser flow can't run on the cloud).
+
+    On the cloud you set two Streamlit secrets:
+      GMAIL_CREDENTIALS_B64 = base64 of credentials.json
+      GMAIL_TOKEN_B64       = base64 of the pickled token.json
+    Locally you just keep credentials/credentials.json + credentials/token.json.
     """
     try:
         from google.auth.transport.requests import Request
@@ -90,45 +100,85 @@ def get_gmail_service():
             "Run: pip install google-auth google-auth-oauthlib google-api-python-client"
         )
 
+    import base64
+    import io
+
     creds = None
 
-    # Load existing token if we have one
-    if Path(TOKEN_FILE).exists():
+    # ── 1. Cloud path: pickled token from base64 env var ────────────────
+    token_b64 = os.getenv("GMAIL_TOKEN_B64", "").strip()
+    if token_b64:
+        try:
+            creds = pickle.loads(base64.b64decode(token_b64))
+        except Exception as e:
+            print(f"⚠ Could not load GMAIL_TOKEN_B64: {e}")
+            creds = None
+
+    # ── 2. Local path: pickled token from disk ──────────────────────────
+    if creds is None and Path(TOKEN_FILE).exists():
         with open(TOKEN_FILE, "rb") as f:
             creds = pickle.load(f)
 
-    # Refresh or get new token
+    # ── 3. Validate / refresh / (local) browser flow ────────────────────
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            # Token expired — refresh automatically (no browser needed)
-            from google.auth.transport.requests import Request
+            # Token expired — refresh automatically (works on cloud too,
+            # no browser needed as long as we have a refresh token).
             creds.refresh(Request())
+            # Persist the refreshed token back to disk if we're local.
+            if not token_b64:
+                try:
+                    with open(TOKEN_FILE, "wb") as f:
+                        pickle.dump(creds, f)
+                except Exception:
+                    pass
         else:
-            # First time — open browser for user consent
-            if not Path(CREDENTIALS_FILE).exists():
-                raise FileNotFoundError(
-                    f"\n❌ Gmail credentials file not found: {CREDENTIALS_FILE}\n\n"
-                    "TO FIX:\n"
-                    "1. Go to https://console.cloud.google.com\n"
-                    "2. Create a project → Enable Gmail API\n"
-                    "3. Go to APIs & Services → Credentials\n"
-                    "4. Create OAuth 2.0 Client ID → Desktop Application\n"
-                    "5. Download JSON → rename to 'credentials.json'\n"
-                    "6. Put it in this project folder\n"
-                    "7. Run the pipeline again\n"
+            # No usable token. On the cloud we CANNOT open a browser, so
+            # fail with a clear message instead of hanging.
+            if token_b64:
+                raise RuntimeError(
+                    "Gmail token in GMAIL_TOKEN_B64 is invalid or expired and "
+                    "has no refresh token. Regenerate token.json locally "
+                    "(run authorize_gmail.py), re-encode it to base64, and "
+                    "update the GMAIL_TOKEN_B64 secret."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+
+            # ── Local first-time OAuth: get credentials.json ────────────
+            # Prefer base64 env var, else the file on disk.
+            creds_b64 = os.getenv("GMAIL_CREDENTIALS_B64", "").strip()
+            if creds_b64:
+                import json
+                import tempfile
+                client_config = json.loads(base64.b64decode(creds_b64))
+                flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+            else:
+                if not Path(CREDENTIALS_FILE).exists():
+                    raise FileNotFoundError(
+                        f"\n❌ Gmail credentials file not found: {CREDENTIALS_FILE}\n\n"
+                        "TO FIX:\n"
+                        "1. Go to https://console.cloud.google.com\n"
+                        "2. Create a project → Enable Gmail API\n"
+                        "3. Go to APIs & Services → Credentials\n"
+                        "4. Create OAuth 2.0 Client ID → Desktop Application\n"
+                        "5. Download JSON → rename to 'credentials.json'\n"
+                        "6. Put it in the credentials/ folder\n"
+                        "7. Run authorize_gmail.py again\n"
+                    )
+                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+
             print("\n🌐 Opening browser for Gmail authorization...")
             print("   Please log in and click 'Allow'\n")
             creds = flow.run_local_server(port=0)
 
-        # Save token for next time
-        with open(TOKEN_FILE, "wb") as f:
-            pickle.dump(creds, f)
-        print("✅ Gmail authorized. Token saved to", TOKEN_FILE)
+            # Save token for next time (local only)
+            try:
+                with open(TOKEN_FILE, "wb") as f:
+                    pickle.dump(creds, f)
+                print("✅ Gmail authorized. Token saved to", TOKEN_FILE)
+            except Exception:
+                pass
 
     return build("gmail", "v1", credentials=creds)
-
 
 def fetch_invoice_emails(service, max_results: int = 50) -> list:
     """
