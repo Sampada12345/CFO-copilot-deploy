@@ -26,6 +26,13 @@ tzlocal>=5.0
 python-dotenv>=1.0
 requests>=2.31
 
+# ── Persistence (Turso / libSQL) ────────────────────────────────────────
+# Current official Turso Python client. NOT libsql-experimental / libsql-client
+# (both deprecated June 2025). Local file when no TURSO_* env vars are set;
+# embedded replica when they are. core/database.py falls back to stdlib sqlite3
+# if this wheel can't install on a given platform.
+libsql==0.1.11
+
 # ── Google API (Gmail agent) ────────────────────────────────────────────
 google-auth>=2.29
 google-auth-oauthlib>=1.2
