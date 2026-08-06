@@ -363,18 +363,84 @@ def _connect(db_path: str):
     return conn
 
 
+import threading  # noqa: E402
+
+# Per-thread cache of live libsql connections. Connecting a Turso embedded
+# replica is expensive (session + sync with the remote primary), and a single
+# page render calls get_db() dozens of times, so we reuse one connection per
+# thread instead of reconnecting every call. Thread-local => background scan /
+# send threads each get their own; no connection is ever shared across threads.
+_conn_cache = threading.local()
+
+
+def _cache_map() -> dict:
+    m = getattr(_conn_cache, "map", None)
+    if m is None:
+        m = _conn_cache.map = {}
+    return m
+
+
+def _cached_conn(db_path: str):
+    m = _cache_map()
+    conn = m.get(db_path)
+    if conn is None:
+        conn = m[db_path] = _connect(db_path)
+    return conn
+
+
+def _drop_cached(db_path: str):
+    """Forget (and close) this thread's cached connection for db_path, so the
+    next get_db() rebuilds a clean one. Used when a connection may be poisoned."""
+    m = _cache_map()
+    conn = m.pop(db_path, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def close_all_connections():
+    """Close and forget this thread's cached connections (tests / shutdown)."""
+    m = _cache_map()
+    for c in list(m.values()):
+        try:
+            c.close()
+        except Exception:
+            pass
+    _conn_cache.map = {}
+
+
 @contextmanager
 def get_db(path: str = None):
     """
-    Opens a database connection. 'with get_db() as conn:' ensures it always
-    closes properly. Works identically whether the backend is libsql (local
-    or Turso embedded replica) or stdlib sqlite3.
+    Opens a database connection. 'with get_db() as conn:' is the one entry point
+    used everywhere. On libsql it REUSES a per-thread connection (fast on Turso);
+    on the stdlib sqlite3 fallback it opens/closes per call (already cheap).
 
-    A fresh connection per call keeps transaction state clean — important on
-    Turso/Hrana, where a reused connection can carry an aborted transaction
-    into the next operation and make subsequent statements fail.
+    SAFETY (this is what makes reuse safe after the earlier Turso crash): on a
+    reused connection we (a) roll back to a clean, transaction-free state after
+    every successful use, and (b) drop the connection entirely if an operation
+    raised — so a poisoned/aborted transaction can never carry forward into the
+    next caller. Writers still commit explicitly; reads need no commit.
     """
     db_path = path or DB_PATH
+
+    if _using_libsql():
+        conn = _cached_conn(db_path)
+        try:
+            yield conn
+        except Exception:
+            _drop_cached(db_path)          # may be poisoned — rebuild next time
+            raise
+        else:
+            try:
+                conn.rollback()            # clear any lingering/implicit txn
+            except Exception:
+                _drop_cached(db_path)
+        return
+
+    # ---- stdlib sqlite3 fallback: cheap to (re)connect, keep per-call ----
     conn = _connect(db_path)
     try:
         yield conn
