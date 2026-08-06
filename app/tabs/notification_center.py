@@ -81,33 +81,61 @@ REMINDABLE_INVOICE_STATUSES = ("unpaid", "overdue", "partial", "promised")
 # ═══════════════════════════════════════════════════════════════════════════
 def ensure_schema():
     """Add v3.1 columns/statuses without breaking existing v3 rows.
-    SQLite allows ADD COLUMN cheaply; wrap in try/except so re-runs are safe.
-    Also self-heals any bad date strings left over from earlier crashes."""
+    Hrana/Turso-safe: check PRAGMA table_info and only add missing columns, so
+    a swallowed 'duplicate column' error never poisons the connection's
+    transaction (which on Turso would break every following statement)."""
     with get_db(DB_PATH) as conn:
-        for stmt in [
-            "ALTER TABLE invoices ADD COLUMN reminder_date TEXT",
-            "ALTER TABLE email_drafts ADD COLUMN scheduled_send_date TEXT",
-            "ALTER TABLE email_drafts ADD COLUMN template_used TEXT",
-            "ALTER TABLE email_drafts ADD COLUMN reviewed_by TEXT",
-            "ALTER TABLE email_drafts ADD COLUMN reviewed_at TEXT",
-        ]:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        def _columns(table: str) -> set:
             try:
-                conn.execute(stmt); conn.commit()
+                return {r[1] for r in conn.execute(
+                    f"PRAGMA table_info({table})").fetchall()}
             except Exception:
-                pass  # column already exists — expected on re-runs
+                return set()
+
+        wanted = {
+            "invoices":     [("reminder_date", "TEXT")],
+            "email_drafts": [("scheduled_send_date", "TEXT"),
+                             ("template_used", "TEXT"),
+                             ("reviewed_by", "TEXT"),
+                             ("reviewed_at", "TEXT")],
+        }
+        for table, cols in wanted.items():
+            existing = _columns(table)
+            if not existing:
+                continue
+            for col, ddl in cols:
+                if col in existing:
+                    continue
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
         # Self-heal: earlier crashes could have written literal 'NaT' or 'None'
         # into date columns.  Convert those to NULL so downstream code
         # (which correctly handles NULL) doesn't trip.
-        for col_table in [("reminder_date",       "invoices"),
-                          ("scheduled_send_date", "email_drafts")]:
-            col, tbl = col_table
+        for col, tbl in [("reminder_date",       "invoices"),
+                         ("scheduled_send_date", "email_drafts")]:
             try:
                 conn.execute(
                     f"UPDATE {tbl} SET {col} = NULL "
                     f"WHERE {col} IN ('NaT', 'None', 'nan', '')"
                 )
                 conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -234,14 +262,11 @@ def generate_upcoming_drafts(today: date | None = None) -> int:
 
 
 def autosend_due_drafts(send_fn, today: date | None = None,
-                         stop_event=None, progress_cb=None,
-                         ignore_schedule=False) -> dict:
-    """Dispatch active drafts.  send_fn(to, subject, body, cc) → bool.
-
-    By default only sends drafts whose scheduled_send_date has arrived.
-    If ignore_schedule=True, sends EVERY active (pending/approved) draft
-    regardless of its scheduled date — used by the "Send all pending now"
-    button.
+                         stop_event=None, progress_cb=None) -> dict:
+    """Dispatch every draft whose send date has arrived and is still active.
+    send_fn(to, subject, body, cc) → bool.  In production wire it to
+    gmail_client.send_email; in the UI dry-run you can pass a lambda that
+    just returns True.
 
     stop_event : a threading.Event.  Checked before EVERY send.  If set,
                  loop exits immediately without dispatching more emails.
@@ -251,21 +276,13 @@ def autosend_due_drafts(send_fn, today: date | None = None,
     today = today or date.today()
     sent, failed, stopped_early = [], [], False
     with get_db(DB_PATH) as conn:
-        if ignore_schedule:
-            # Send every active draft, no date filter.
-            rows = conn.execute(
-                "SELECT * FROM email_drafts "
-                f"WHERE status IN ({','.join('?' * len(ACTIVE_STATUSES))})",
-                (*ACTIVE_STATUSES,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM email_drafts "
-                f"WHERE status IN ({','.join('?' * len(ACTIVE_STATUSES))}) "
-                "  AND scheduled_send_date IS NOT NULL "
-                "  AND scheduled_send_date <= ?",
-                (*ACTIVE_STATUSES, today.isoformat()),
-            ).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM email_drafts "
+            f"WHERE status IN ({','.join('?' * len(ACTIVE_STATUSES))}) "
+            "  AND scheduled_send_date IS NOT NULL "
+            "  AND scheduled_send_date <= ?",
+            (*ACTIVE_STATUSES, today.isoformat()),
+        ).fetchall()
         total = len(rows)
         for i, d in enumerate(rows):
             # ── cooperative stop check ──────────────────────────────────
@@ -449,14 +466,10 @@ def _run_send_worker(send_fn):
             _send_state["sent"]   = sent
             _send_state["failed"] = failed
             _send_state["total"]  = total
-    # Read the ignore_schedule flag set by whichever button launched us.
-    with _send_lock:
-        ignore_sched = _send_state.get("ignore_schedule", False)
     result = autosend_due_drafts(
         send_fn,
         stop_event=_send_state["stop_event"],
         progress_cb=progress,
-        ignore_schedule=ignore_sched,
     )
     with _send_lock:
         _send_state["sent"]          = len(result["sent"])
@@ -464,20 +477,6 @@ def _run_send_worker(send_fn):
         _send_state["total"]         = result["total"]
         _send_state["stopped_early"] = result["stopped_early"]
         _send_state["finished_at"]   = datetime.now()
-
-
-def _launch_send(send_fn, ignore_schedule=False):
-    """Start the background send worker. Shared by both send buttons."""
-    _reset_send_state()
-    stop_ev = threading.Event()
-    with _send_lock:
-        _send_state["stop_event"] = stop_ev
-        _send_state["started_at"] = datetime.now()
-        _send_state["ignore_schedule"] = ignore_schedule
-    t = threading.Thread(target=_run_send_worker, args=(send_fn,), daemon=True)
-    with _send_lock:
-        _send_state["thread"] = t
-    t.start()
 
 
 def _render_send_all_controls(send_fn):
@@ -506,19 +505,16 @@ def _render_send_all_controls(send_fn):
             if send_fn is None:
                 st.error("No sender configured.")
             else:
-                _launch_send(send_fn, ignore_schedule=False)
-                st.rerun()
-
-        # v3.5.4 — Send ALL pending regardless of scheduled date.
-        if st.button("🚀 Send all pending now (ignore dates)",
-                     use_container_width=True, type="secondary",
-                     help="Dispatch EVERY pending/approved reminder right now, "
-                          "even if its scheduled send date is in the future. "
-                          "Use with care — this emails the whole queue."):
-            if send_fn is None:
-                st.error("No sender configured.")
-            else:
-                _launch_send(send_fn, ignore_schedule=True)
+                _reset_send_state()
+                stop_ev = threading.Event()
+                with _send_lock:
+                    _send_state["stop_event"] = stop_ev
+                    _send_state["started_at"] = datetime.now()
+                t = threading.Thread(
+                    target=_run_send_worker, args=(send_fn,), daemon=True)
+                with _send_lock:
+                    _send_state["thread"] = t
+                t.start()
                 st.rerun()
     else:
         # RUNNING — show Stop button + live counter, and auto-refresh
