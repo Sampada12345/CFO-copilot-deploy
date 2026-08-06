@@ -270,6 +270,14 @@ CREATE TABLE IF NOT EXISTS invoices (
     gmail_message_id TEXT    UNIQUE,
     gmail_thread_id  TEXT,
     email_subject    TEXT,
+    -- PTP / reminder columns (also added defensively by ptp_intelligence
+    -- .ensure_schema() for DBs created before v3.3, but included here so a
+    -- fresh database — e.g. a new Turso primary — has them from the start).
+    original_due_date     TEXT,
+    latest_due_date       TEXT,
+    extension_count       INTEGER DEFAULT 0,
+    expected_payment_date TEXT,
+    reminder_date         TEXT,
     created_at       TEXT    DEFAULT (datetime('now', 'localtime')),
     updated_at       TEXT    DEFAULT (datetime('now', 'localtime'))
 );
@@ -285,6 +293,9 @@ CREATE TABLE IF NOT EXISTS email_drafts (
     body         TEXT    NOT NULL,
     status       TEXT    DEFAULT 'pending'
                      CHECK(status IN ('pending','approved','rejected','sent','failed')),
+    template_used       TEXT,
+    scheduled_send_date TEXT,
+    reviewed_by         TEXT,
     created_at   TEXT    DEFAULT (datetime('now', 'localtime')),
     reviewed_at  TEXT,
     sent_at      TEXT
@@ -358,13 +369,20 @@ def get_db(path: str = None):
     Opens a database connection. 'with get_db() as conn:' ensures it always
     closes properly. Works identically whether the backend is libsql (local
     or Turso embedded replica) or stdlib sqlite3.
+
+    A fresh connection per call keeps transaction state clean — important on
+    Turso/Hrana, where a reused connection can carry an aborted transaction
+    into the next operation and make subsequent statements fail.
     """
     db_path = path or DB_PATH
     conn = _connect(db_path)
     try:
         yield conn
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db(path: str = None):
