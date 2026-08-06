@@ -7,7 +7,7 @@ PURPOSE: Everything related to the operational database.
 STORAGE BACKEND (v3.6 — Turso migration)
 -----------------------------------------
 This file used to hardcode Python's stdlib ``sqlite3``. It now speaks to
-one of two backends, chosen automatically at runtime — WITHOUT changing a
+one of two backends, chosen automatcally at runtime — WITHOUT changing a
 single call site elsewhere in the codebase:
 
   1. libsql (default)     — the Turso client, package name ``libsql``
