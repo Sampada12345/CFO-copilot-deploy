@@ -1,17 +1,49 @@
 """
-FILE: backend/database.py
-PURPOSE: Everything related to the SQLite database.
+FILE: core/database.py
+PURPOSE: Everything related to the operational database.
          Creates tables, stores data, fetches data.
          Think of this as the "memory" of the entire system.
 
-WHY SQLite?
-  - It's just a single file on your laptop (invoices.db)
-  - No need to install any database server
-  - Works everywhere, zero configuration
+STORAGE BACKEND (v3.6 — Turso migration)
+-----------------------------------------
+This file used to hardcode Python's stdlib ``sqlite3``. It now speaks to
+one of two backends, chosen automatically at runtime — WITHOUT changing a
+single call site elsewhere in the codebase:
+
+  1. libsql (default)     — the Turso client, package name ``libsql``
+                            (pip install libsql). NOTE: the older
+                            ``libsql-experimental`` / ``libsql-client``
+                            packages are DEPRECATED — do not use them.
+       • Local dev:  no env vars needed → opens a plain local file
+                     (``invoices.db``), fully offline, behaves like sqlite.
+       • Cloud:      set TURSO_DATABASE_URL + TURSO_AUTH_TOKEN → the same
+                     local file becomes an EMBEDDED REPLICA: reads are
+                     served locally, writes go to the Turso primary and
+                     reflect back, so state survives Streamlit Cloud
+                     container restarts (the whole point of this change).
+
+  2. stdlib sqlite3       — automatic fallback if the ``libsql`` wheel
+                            can't be imported (e.g. no prebuilt wheel for
+                            your exact Python/OS), or if you force it with
+                            USE_LIBSQL=0. Keeps local dev unblocked no
+                            matter what.
+
+WHY THIS DESIGN
+  libsql returns plain tuples from fetchone()/fetchall() and has no
+  ``row_factory``. The rest of the app relies on sqlite3.Row semantics —
+  ``row["column"]``, ``row[0]``, ``dict(row)``, ``row.keys()``. A tiny set
+  of proxies below restores exactly that, so every ``with get_db() as
+  conn:`` site across tabs/, ai/, services/ keeps working untouched.
+
+ENV VARS
+  DB_PATH               local database file           (default ./invoices.db)
+  USE_LIBSQL            "1"/"0" — prefer libsql        (default "1")
+  TURSO_DATABASE_URL    libsql://<db>.turso.io         (cloud only; enables sync)
+  TURSO_AUTH_TOKEN      Turso auth token               (cloud only)
 """
 
-import sqlite3
 import os
+import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional
@@ -19,52 +51,230 @@ from typing import Optional
 DB_PATH = os.getenv("DB_PATH", "./invoices.db")
 
 
-# ─────────────────────────────────────────────────────────────
-# DATABASE SCHEMA  (the structure of all tables)
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# BACKEND SELECTION
+# ═════════════════════════════════════════════════════════════
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+USE_LIBSQL  = _env_flag("USE_LIBSQL", "1")
+
+# NOTE: TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are read LAZILY (see _turso_url /
+# _turso_token below), NOT captured at import time. On Streamlit Cloud the
+# secrets->os.environ bridge in main.py may run AFTER this module is first
+# imported; reading them at call time means Turso still activates regardless of
+# import order. (USE_LIBSQL stays at import time only because it gates the
+# libsql import itself, and it defaults ON — cloud never needs to disable it.)
+
+# Try to import the libsql client. If it isn't installed / has no wheel for
+# this platform, we silently fall back to stdlib sqlite3 so nothing breaks.
+_LIBSQL = None
+if USE_LIBSQL:
+    try:
+        import libsql as _LIBSQL  # noqa: N816  (Turso's package, v0.1.11+)
+    except Exception as _imp_err:  # pragma: no cover - depends on env
+        _LIBSQL = None
+        print(f"ℹ️  libsql not available ({_imp_err.__class__.__name__}); "
+              f"using stdlib sqlite3.")
+
+
+def _turso_url() -> str:
+    return os.getenv("TURSO_DATABASE_URL", "").strip()
+
+
+def _turso_token() -> str:
+    return os.getenv("TURSO_AUTH_TOKEN", "").strip()
+
+
+def _using_libsql() -> bool:
+    return _LIBSQL is not None
+
+
+def sync_enabled() -> bool:
+    """True when we're a Turso embedded replica (cloud), i.e. a remote
+    primary is configured. Used to decide when to pull remote state."""
+    return _using_libsql() and bool(_turso_url())
+
+
+def backend_name() -> str:
+    """Human-readable backend label, handy for a diagnostics panel."""
+    if not _using_libsql():
+        return "sqlite3 (stdlib, local file)"
+    return "libsql embedded replica (Turso)" if sync_enabled() else "libsql (local file)"
+
+
+# ═════════════════════════════════════════════════════════════
+# ROW-COMPATIBILITY SHIM
+# Restores sqlite3.Row semantics over libsql's plain-tuple rows so that
+# NOTHING downstream has to change: row["col"], row[0], dict(row), keys().
+# ═════════════════════════════════════════════════════════════
+
+class _Row:
+    __slots__ = ("_cols", "_vals", "_map")
+
+    def __init__(self, cols, vals):
+        self._cols = cols
+        self._vals = vals
+        self._map = None  # built lazily on first keyed access
+
+    def _mapping(self):
+        if self._map is None:
+            self._map = {c: v for c, v in zip(self._cols, self._vals)}
+        return self._map
+
+    def __getitem__(self, key):
+        # Integer / slice → positional (like sqlite3.Row);  str → by column name
+        if isinstance(key, (int, slice)):
+            return self._vals[key]
+        return self._mapping()[key]
+
+    def get(self, key, default=None):
+        return self._mapping().get(key, default)
+
+    def keys(self):
+        return list(self._cols)
+
+    def __iter__(self):
+        # tuple(row) / unpacking iterate values, matching sqlite3.Row
+        return iter(self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+    def __contains__(self, key):
+        return key in self._mapping()
+
+    def __eq__(self, other):
+        if isinstance(other, _Row):
+            return self._vals == other._vals and list(self._cols) == list(other._cols)
+        return NotImplemented
+
+    def __repr__(self):
+        return f"Row({self._mapping()!r})"
+
+
+class _CursorProxy:
+    """Wraps a libsql cursor so fetch* return _Row objects.
+    Everything else (description, lastrowid, rowcount, close) passes through."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    @property
+    def _cols(self):
+        desc = self._cur.description
+        return [d[0] for d in desc] if desc else []
+
+    def fetchone(self):
+        r = self._cur.fetchone()
+        return None if r is None else _Row(self._cols, r)
+
+    def fetchall(self):
+        cols = self._cols
+        return [_Row(cols, r) for r in self._cur.fetchall()]
+
+    def fetchmany(self, size=None):
+        rows = self._cur.fetchmany(size) if size is not None else self._cur.fetchmany()
+        cols = self._cols
+        return [_Row(cols, r) for r in rows]
+
+    def __iter__(self):
+        cols = self._cols
+        for r in self._cur:
+            yield _Row(cols, r)
+
+    def __getattr__(self, name):
+        # description, lastrowid, rowcount, arraysize, close, ...
+        return getattr(self._cur, name)
+
+
+class _ConnProxy:
+    """Wraps a libsql connection so .execute() yields row-dict cursors and the
+    sqlite3-style surface used across the codebase keeps working. Also usable
+    as a context manager (``with _connect() as conn:``) like sqlite3."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        cur = (self._conn.execute(sql, params)
+               if params is not None else self._conn.execute(sql))
+        return _CursorProxy(cur)
+
+    def executemany(self, sql, seq_of_params):
+        return _CursorProxy(self._conn.executemany(sql, seq_of_params))
+
+    def executescript(self, script):
+        return self._conn.executescript(script)
+
+    def cursor(self):
+        return _CursorProxy(self._conn.cursor())
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def sync(self):
+        # Pull latest frames from the Turso primary into the local replica.
+        return self._conn.sync()
+
+    def close(self):
+        return self._conn.close()
+
+    # Allow `with get_db() as conn:` style even on a bare proxy.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+# ═════════════════════════════════════════════════════════════
+# DATABASE SCHEMA  (unchanged — the structure of all tables)
+# ═════════════════════════════════════════════════════════════
 
 SCHEMA = """
 
 -- TABLE 1: clients
--- One row for every unique client (company or person)
--- We identify clients by their email address
 CREATE TABLE IF NOT EXISTS clients (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT    NOT NULL,
-    email      TEXT    UNIQUE,           -- must be unique per client
+    email      TEXT    UNIQUE,
     created_at TEXT    DEFAULT (datetime('now', 'localtime')),
     updated_at TEXT    DEFAULT (datetime('now', 'localtime'))
 );
 
 -- TABLE 2: invoices
--- One row per invoice found in emails
--- Links to clients table via client_id
 CREATE TABLE IF NOT EXISTS invoices (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     client_id        INTEGER NOT NULL REFERENCES clients(id),
     invoice_number   TEXT,
-    invoice_date     TEXT,                -- format: YYYY-MM-DD
-    due_date         TEXT,                -- format: YYYY-MM-DD
-    amount           REAL,                -- base amount before tax
-    gst_amount       REAL,                -- GST / tax portion
-    total_amount     REAL,                -- final amount after tax
+    invoice_date     TEXT,
+    due_date         TEXT,
+    amount           REAL,
+    gst_amount       REAL,
+    total_amount     REAL,
     currency         TEXT    DEFAULT 'INR',
     status           TEXT    DEFAULT 'unpaid'
                          CHECK(status IN ('unpaid','paid','overdue','partial')),
-    description      TEXT,                -- what the invoice is for
-    confidence       REAL,                -- how confident AI was (0.0 to 1.0)
-    gmail_message_id TEXT    UNIQUE,      -- prevents scanning same email twice
+    description      TEXT,
+    confidence       REAL,
+    gmail_message_id TEXT    UNIQUE,
     gmail_thread_id  TEXT,
-    email_subject    TEXT,                -- original email subject line
+    email_subject    TEXT,
     created_at       TEXT    DEFAULT (datetime('now', 'localtime')),
     updated_at       TEXT    DEFAULT (datetime('now', 'localtime'))
 );
 
 -- TABLE 3: email_drafts
--- Stores AI-generated reminder emails BEFORE the user approves them
--- This is the "review queue" — user sees these in the dashboard
--- Status can be: pending (waiting for review), approved (user said yes),
---                rejected (user said no), sent (actually sent)
 CREATE TABLE IF NOT EXISTS email_drafts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     invoice_id   INTEGER NOT NULL REFERENCES invoices(id),
@@ -76,24 +286,20 @@ CREATE TABLE IF NOT EXISTS email_drafts (
     status       TEXT    DEFAULT 'pending'
                      CHECK(status IN ('pending','approved','rejected','sent','failed')),
     created_at   TEXT    DEFAULT (datetime('now', 'localtime')),
-    reviewed_at  TEXT,                   -- when user clicked approve/reject
-    sent_at      TEXT                    -- when email was actually sent
+    reviewed_at  TEXT,
+    sent_at      TEXT
 );
 
 -- TABLE 4: push_subscriptions
--- Stores browser push notification tokens
--- When you open the dashboard and allow notifications,
--- the browser gives us a token we save here
 CREATE TABLE IF NOT EXISTS push_subscriptions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    endpoint   TEXT    NOT NULL UNIQUE,  -- browser's push endpoint URL
-    p256dh     TEXT    NOT NULL,         -- encryption key
-    auth       TEXT    NOT NULL,         -- auth secret
+    endpoint   TEXT    NOT NULL UNIQUE,
+    p256dh     TEXT    NOT NULL,
+    auth       TEXT    NOT NULL,
     created_at TEXT    DEFAULT (datetime('now', 'localtime'))
 );
 
 -- TABLE 5: agent_runs
--- Audit log: every time the pipeline runs, we record what happened
 CREATE TABLE IF NOT EXISTS agent_runs (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     run_at             TEXT    DEFAULT (datetime('now', 'localtime')),
@@ -106,7 +312,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     duration_seconds   REAL
 );
 
--- INDEXES: make common queries fast
+-- INDEXES
 CREATE INDEX IF NOT EXISTS idx_invoices_due_date  ON invoices(due_date);
 CREATE INDEX IF NOT EXISTS idx_invoices_status    ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_invoices_client    ON invoices(client_id);
@@ -115,21 +321,46 @@ CREATE INDEX IF NOT EXISTS idx_drafts_invoice     ON email_drafts(invoice_id);
 """
 
 
-# ─────────────────────────────────────────────────────────────
-# CONNECTION HELPER
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# CONNECTION HELPER  (same public API: `with get_db() as conn:`)
+# ═════════════════════════════════════════════════════════════
+
+def _connect(db_path: str):
+    """Open a raw connection using whichever backend is active, wrapped so the
+    sqlite3.Row-style surface is preserved. Not a context manager itself —
+    get_db() handles lifecycle."""
+    if _using_libsql():
+        if sync_enabled():
+            raw = _LIBSQL.connect(db_path, sync_url=_turso_url(),
+                                  auth_token=_turso_token())
+        else:
+            raw = _LIBSQL.connect(db_path)
+        conn = _ConnProxy(raw)
+        # Enforce table relationships. Best-effort: never crash if a backend
+        # variant doesn't accept the PRAGMA.
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+        except Exception:
+            pass
+        return conn
+
+    # ---- stdlib sqlite3 fallback (original behaviour, byte-for-byte) ----
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
 
 @contextmanager
 def get_db(path: str = None):
     """
-    Opens a database connection.
-    Using 'with get_db() as conn:' ensures it always closes properly.
+    Opens a database connection. 'with get_db() as conn:' ensures it always
+    closes properly. Works identically whether the backend is libsql (local
+    or Turso embedded replica) or stdlib sqlite3.
     """
     db_path = path or DB_PATH
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row        # lets us use dict-like access: row["name"]
-    conn.execute("PRAGMA foreign_keys=ON") # enforce table relationships
-    conn.execute("PRAGMA journal_mode=WAL") # better performance for concurrent access
+    conn = _connect(db_path)
     try:
         yield conn
     finally:
@@ -137,16 +368,60 @@ def get_db(path: str = None):
 
 
 def init_db(path: str = None):
-    """Creates all tables if they don't already exist."""
-    with get_db(path) as conn:
+    """Creates all tables if they don't already exist.
+
+    On a Turso embedded replica (cloud), we pull the latest state down from
+    the primary FIRST, so a freshly-started container with an empty local
+    replica file doesn't shadow real data. The CREATE TABLE IF NOT EXISTS
+    statements are then no-ops when the tables already exist upstream.
+    """
+    db_path = path or DB_PATH
+    with get_db(db_path) as conn:
+        if sync_enabled():
+            try:
+                conn.sync()
+            except Exception as e:  # pragma: no cover - network dependent
+                print(f"⚠️  Turso initial sync failed (continuing): {e}")
         conn.executescript(SCHEMA)
         conn.commit()
-    print(f"✅ Database ready at: {path or DB_PATH}")
+    print(f"✅ Database ready at: {db_path}  [{backend_name()}]")
 
 
-# ─────────────────────────────────────────────────────────────
+def sync_now(path: str = None) -> bool:
+    """Explicitly pull remote changes into the local replica. No-op (returns
+    False) when not running against a Turso primary. Safe to call anytime."""
+    if not sync_enabled():
+        return False
+    try:
+        with get_db(path) as conn:
+            conn.sync()
+        return True
+    except Exception as e:  # pragma: no cover - network dependent
+        print(f"⚠️  Turso sync failed: {e}")
+        return False
+
+
+def read_sql_df(sql: str, params=(), path: str = None):
+    """Backend-agnostic replacement for ``pd.read_sql(sql, sqlite3.connect(...))``.
+
+    pandas' read_sql wants a DBAPI/SQLAlchemy connection, which the libsql proxy
+    isn't a perfect match for — and a raw ``sqlite3.connect(file)`` would bypass
+    Turso entirely. This runs the query through get_db() (so it hits whatever
+    backend is active) and builds the DataFrame from the cursor's description +
+    rows. Works identically on libsql, a Turso embedded replica, and stdlib
+    sqlite3.
+    """
+    import pandas as pd
+    with get_db(path) as conn:
+        cur = conn.execute(sql, params)
+        cols = [d[0] for d in (cur.description or [])]
+        rows = cur.fetchall()
+    return pd.DataFrame([tuple(r) for r in rows], columns=cols)
+
+
+# ═════════════════════════════════════════════════════════════
 # CLIENT OPERATIONS
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 
 def upsert_client(conn, name: str, email: Optional[str]) -> int:
     """
@@ -155,7 +430,6 @@ def upsert_client(conn, name: str, email: Optional[str]) -> int:
     Returns the client's ID number.
     """
     if email:
-        # Try to find by email first (most reliable identifier)
         row = conn.execute("SELECT id FROM clients WHERE email=?", (email,)).fetchone()
         if row:
             conn.execute(
@@ -164,30 +438,26 @@ def upsert_client(conn, name: str, email: Optional[str]) -> int:
             )
             return row["id"]
     else:
-        # No email — try to find by name
         row = conn.execute("SELECT id FROM clients WHERE name=?", (name,)).fetchone()
         if row:
             return row["id"]
 
-    # Client not found — create new
     conn.execute("INSERT INTO clients (name, email) VALUES (?, ?)", (name, email))
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 # INVOICE OPERATIONS
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 
 VALID_STATUSES = {"unpaid", "paid", "overdue", "partial"}
 
 
 def normalize_status(raw_status) -> str:
     """
-    Llama/Groq sometimes return status values outside our 4 allowed values
-    (e.g. "due", "pending", "N/A", "Paid in full", None, etc.)
-    This function maps anything the AI returns into one of our 4 valid values.
-    If nothing matches, defaults to "unpaid" (safe default — better to remind
-    than to silently skip a real invoice).
+    Llama/Groq sometimes return status values outside our 4 allowed values.
+    Maps anything the AI returns into one of our 4 valid values. Defaults to
+    "unpaid" (safe — better to remind than to silently skip a real invoice).
     """
     if not raw_status:
         return "unpaid"
@@ -197,7 +467,6 @@ def normalize_status(raw_status) -> str:
     if s in VALID_STATUSES:
         return s
 
-    # Map common AI variations to our valid set
     if any(word in s for word in ["paid", "settled", "cleared", "complete"]):
         if "partial" in s or "part" in s:
             return "partial"
@@ -212,29 +481,25 @@ def normalize_status(raw_status) -> str:
         return "partial"
 
     if any(word in s for word in ["due", "pending", "unpaid", "outstanding",
-                                    "n/a", "none", "null", "unknown"]):
+                                  "n/a", "none", "null", "unknown"]):
         return "unpaid"
 
-    # Anything else unrecognised → safe default
     return "unpaid"
 
 
 def store_invoice(conn, inv: dict) -> tuple:
     """
     Save an extracted invoice to the database.
-    Returns (invoice_id, action) where action tells you what happened:
+    Returns (invoice_id, action):
       - 'inserted'  → brand new invoice saved
-      - 'updated'   → existing invoice status was refreshed
-      - 'skipped'   → duplicate or too uncertain, ignored
+      - 'updated'   → existing invoice status refreshed
+      - 'skipped_*' → duplicate or too uncertain, ignored
     """
-    # Always normalise status FIRST — fixes AI returning unexpected values
     inv["status"] = normalize_status(inv.get("status"))
 
-    # Skip if AI wasn't confident enough
     if inv.get("confidence") is not None and inv["confidence"] < 0.40:
         return None, "skipped_low_confidence"
 
-    # Skip if we already processed this exact email
     if inv.get("gmail_message_id"):
         existing = conn.execute(
             "SELECT id FROM invoices WHERE gmail_message_id=?",
@@ -247,10 +512,8 @@ def store_invoice(conn, inv: dict) -> tuple:
             )
             return existing["id"], "updated"
 
-    # Get or create client
     client_id = upsert_client(conn, inv["client_name"], inv.get("client_email"))
 
-    # Skip if same invoice number from same client already exists
     if inv.get("invoice_number"):
         existing = conn.execute(
             "SELECT id FROM invoices WHERE invoice_number=? AND client_id=?",
@@ -263,7 +526,6 @@ def store_invoice(conn, inv: dict) -> tuple:
             )
             return existing["id"], "updated"
 
-    # Insert new invoice
     conn.execute("""
         INSERT INTO invoices (
             client_id, invoice_number, invoice_date, due_date,
@@ -294,22 +556,12 @@ def store_invoice(conn, inv: dict) -> tuple:
 def get_invoices_needing_reminder(conn, days: int = 7) -> list:
     """
     Find unpaid/partial/overdue invoices that need a reminder email.
-
-    INCLUDES:
-      - Invoices due within the next N days (upcoming)
-      - Invoices already overdue (past due date) — these need reminders too!
-
-    EXCLUDES:
-      - Paid invoices
-      - Invoices that already have a pending or approved draft
-      - Invoices with no client email (can't send to them)
-
-    Also handles Llama sometimes returning dates in wrong format.
+    Includes upcoming (due within N days) AND already-overdue invoices.
+    Excludes paid invoices, invoices with a pending/approved draft, and
+    invoices with no client email. Handles messy AI date formats in Python.
     """
-    future = (datetime.now().date() + timedelta(days=days)).isoformat()
+    future = (datetime.now().date() + timedelta(days=days)).isoformat()  # noqa: F841
 
-    # Fetch all unpaid/partial/overdue invoices that have a due date
-    # We fetch a broad set and filter in Python to handle date format issues
     rows = conn.execute("""
         SELECT
             i.*,
@@ -337,7 +589,6 @@ def get_invoices_needing_reminder(conn, days: int = 7) -> list:
         inv = dict(row)
         raw_due = inv.get("due_date", "")
 
-        # Try to parse the due date — handle multiple formats Llama might return
         due_date = None
         for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%B %d, %Y", "%d %B %Y"):
             try:
@@ -347,13 +598,12 @@ def get_invoices_needing_reminder(conn, days: int = 7) -> list:
                 continue
 
         if due_date is None:
-            # Can't parse date — include it anyway with a note (better to remind than miss)
-            print(f"    ⚠️  Could not parse due_date '{raw_due}' for invoice #{inv.get('invoice_number')} — including in reminders")
+            print(f"    ⚠️  Could not parse due_date '{raw_due}' for invoice "
+                  f"#{inv.get('invoice_number')} — including in reminders")
             inv["days_until_due"] = 0
             result.append(inv)
             continue
 
-        # Include if: overdue (past) OR due within the window (future)
         if due_date <= future_dt:
             inv["days_until_due"] = (due_date - today).days
             result.append(inv)
@@ -383,9 +633,9 @@ def get_all_invoices(conn) -> list:
     return [dict(r) for r in rows]
 
 
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 # EMAIL DRAFT OPERATIONS
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 
 def save_draft(conn, draft: dict) -> int:
     """Save a generated email draft for user review."""
@@ -463,9 +713,9 @@ def mark_draft_failed(conn, draft_id: int):
     conn.commit()
 
 
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 # PUSH SUBSCRIPTION OPERATIONS
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 
 def save_push_subscription(conn, endpoint: str, p256dh: str, auth: str):
     """Save browser push notification credentials."""
@@ -489,9 +739,9 @@ def delete_push_subscription(conn, endpoint: str):
     conn.commit()
 
 
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 # SUMMARY & STATS
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 
 def get_summary(conn) -> dict:
     """Get counts and totals for the dashboard header cards."""
@@ -515,9 +765,9 @@ def get_summary(conn) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 # AGENT RUN LOGGING
-# ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
 
 def log_run(conn, data: dict):
     """Save a record of this pipeline run to the audit log."""
