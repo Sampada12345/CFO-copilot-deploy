@@ -58,33 +58,66 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 #  1. SCHEMA
 # ═══════════════════════════════════════════════════════════════════════════
 def ensure_schema() -> None:
-    """Idempotent — safe to call on every app load. Adds v3.3 columns/tables
-    without touching v3.2 data.  Each ALTER is wrapped so a repeat run just
-    swallows the 'duplicate column' error."""
+    """Idempotent — safe to call on every app load. Adds v3.3+ columns/tables
+    without touching existing data.
+
+    Hrana/Turso-safe: the old version blindly ran every ALTER and swallowed the
+    'duplicate column' error. On Turso that swallowed failure leaves the
+    connection's stream in an aborted-transaction state, so the NEXT statement
+    (e.g. the original_due_date back-fill) blows up with 'no such column' and
+    takes the whole app down. Instead we read PRAGMA table_info first and only
+    add columns that are genuinely missing, committing on success and rolling
+    back on failure so a poisoned transaction never carries forward.
+    """
     with get_db(DB_PATH) as conn:
-        for stmt in [
-            "ALTER TABLE invoices ADD COLUMN original_due_date TEXT",
-            "ALTER TABLE invoices ADD COLUMN latest_due_date TEXT",
-            "ALTER TABLE invoices ADD COLUMN extension_count INTEGER DEFAULT 0",
-            "ALTER TABLE invoices ADD COLUMN expected_payment_date TEXT",
-            # These belong to reminder_center's schema, but we add them
-            # here defensively so the timeline query works even if
-            # reminder_center hasn't been imported yet in this process.
-            "ALTER TABLE email_drafts ADD COLUMN template_used TEXT",
-            "ALTER TABLE email_drafts ADD COLUMN scheduled_send_date TEXT",
-            "ALTER TABLE email_drafts ADD COLUMN reviewed_by TEXT",
-            "ALTER TABLE email_drafts ADD COLUMN reviewed_at TEXT",
-            # v3.6 — direction on scanned mail: 'in' = client reply (inbox),
-            # 'out' = a reminder we sent (sent box). Lets the timeline show
-            # manually-sent reminders that never went through the app.
-            # (Repeat-safe: fails harmlessly on a fresh DB where the table
-            #  doesn't exist yet — the CREATE below already includes it.)
-            "ALTER TABLE client_replies ADD COLUMN direction TEXT DEFAULT 'in'",
-        ]:
+        # Begin from a clean transaction state (the connection may arrive with
+        # an open/aborted txn on some backends).
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        def _columns(table: str) -> set[str]:
             try:
-                conn.execute(stmt); conn.commit()
+                return {r[1] for r in conn.execute(
+                    f"PRAGMA table_info({table})").fetchall()}
             except Exception:
-                pass
+                return set()
+
+        wanted = {
+            "invoices": [
+                ("original_due_date",     "TEXT"),
+                ("latest_due_date",       "TEXT"),
+                ("extension_count",       "INTEGER DEFAULT 0"),
+                ("expected_payment_date", "TEXT"),
+            ],
+            "email_drafts": [
+                ("template_used",       "TEXT"),
+                ("scheduled_send_date", "TEXT"),
+                ("reviewed_by",         "TEXT"),
+                ("reviewed_at",         "TEXT"),
+            ],
+            # client_replies is (re)created just below; on a fresh DB it won't
+            # exist here yet (skipped), on an older DB this adds the column.
+            "client_replies": [
+                ("direction", "TEXT DEFAULT 'in'"),
+            ],
+        }
+        for table, cols in wanted.items():
+            existing = _columns(table)
+            if not existing:
+                continue  # table not created yet — the CREATEs below handle it
+            for col, ddl in cols:
+                if col in existing:
+                    continue
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS client_replies (
@@ -130,17 +163,24 @@ def ensure_schema() -> None:
         """)
         conn.commit()
 
-        # Back-fill original_due_date for existing invoices that predate v3.3.
-        # ONLY on rows where it's still NULL — never overwrite an existing value.
-        conn.execute("""
-            UPDATE invoices SET original_due_date = due_date
-             WHERE original_due_date IS NULL AND due_date IS NOT NULL
-        """)
-        conn.execute("""
-            UPDATE invoices SET latest_due_date = due_date
-             WHERE latest_due_date IS NULL AND due_date IS NOT NULL
-        """)
-        conn.commit()
+        # Back-fill original_due_date / latest_due_date for rows that predate
+        # v3.3. Guarded individually so a problem here can never take the app
+        # down (the columns now exist both in the base schema and via the
+        # ALTERs above, so this should always succeed).
+        for stmt in (
+            "UPDATE invoices SET original_due_date = due_date "
+            "WHERE original_due_date IS NULL AND due_date IS NOT NULL",
+            "UPDATE invoices SET latest_due_date = due_date "
+            "WHERE latest_due_date IS NULL AND due_date IS NOT NULL",
+        ):
+            try:
+                conn.execute(stmt)
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
