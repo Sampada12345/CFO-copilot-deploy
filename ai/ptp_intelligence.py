@@ -74,6 +74,12 @@ def ensure_schema() -> None:
             "ALTER TABLE email_drafts ADD COLUMN scheduled_send_date TEXT",
             "ALTER TABLE email_drafts ADD COLUMN reviewed_by TEXT",
             "ALTER TABLE email_drafts ADD COLUMN reviewed_at TEXT",
+            # v3.6 — direction on scanned mail: 'in' = client reply (inbox),
+            # 'out' = a reminder we sent (sent box). Lets the timeline show
+            # manually-sent reminders that never went through the app.
+            # (Repeat-safe: fails harmlessly on a fresh DB where the table
+            #  doesn't exist yet — the CREATE below already includes it.)
+            "ALTER TABLE client_replies ADD COLUMN direction TEXT DEFAULT 'in'",
         ]:
             try:
                 conn.execute(stmt); conn.commit()
@@ -97,6 +103,7 @@ def ensure_schema() -> None:
                 ai_promised_date  TEXT,             -- YYYY-MM-DD or NULL
                 ai_confidence     REAL,
                 is_ptp            INTEGER DEFAULT 0,-- set to 1 by rule engine
+                direction         TEXT DEFAULT 'in',-- 'in' = reply | 'out' = sent reminder
                 created_at        TEXT DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (client_id)  REFERENCES clients(id),
                 FOREIGN KEY (invoice_id) REFERENCES invoices(id)
@@ -485,9 +492,19 @@ def _match_reply_to_invoice(conn, sender: str, subject: str,
     return client_id, invoice_id
 
 
-def ingest_reply(conn, email: dict, today: date | None = None) -> dict:
-    """Store one email + AI extraction + PTP application. Dedupes on
-    gmail_message_id so a rerun is idempotent."""
+def ingest_reply(conn, email: dict, today: date | None = None,
+                 direction: str = "in", counterparty_email: str | None = None) -> dict:
+    """Store one scanned email. Dedupes on gmail_message_id so a rerun is
+    idempotent.
+
+    direction='in'  → an INBOUND client reply: match on the sender, run the
+                      AI extraction, and apply any PTP.
+    direction='out' → an OUTBOUND reminder we sent (from the Gmail SENT box):
+                      the client is the RECIPIENT, not the sender, so match on
+                      `counterparty_email`. We do NOT run PTP extraction on our
+                      own outbound mail — it's stored purely so the Tab-2
+                      timeline can show manually-sent reminders.
+    """
     ensure_schema()
     gid = email.get("id") or email.get("gmail_message_id")
     if gid:
@@ -495,11 +512,34 @@ def ingest_reply(conn, email: dict, today: date | None = None) -> dict:
                            (gid,)).fetchone()
         if dup:
             return {"stored": False, "reason": "already ingested",
-                    "reply_id": dup["id"]}
+                    "reply_id": dup["id"], "direction": direction}
 
-    sender  = (email.get("from") or "").strip().lower()
     subject = email.get("subject") or ""
     body    = email.get("body") or ""
+
+    # ── OUTBOUND (sent box) ──────────────────────────────────────────────
+    if direction == "out":
+        # The counterparty (client) is who we sent TO. Resolve them, then link
+        # to their most relevant invoice via the shared matcher.
+        cp = (counterparty_email or "").strip().lower()
+        client_id, invoice_id = _match_reply_to_invoice(conn, cp, subject, body)
+        cur = conn.execute("""
+            INSERT INTO client_replies
+              (gmail_message_id, client_id, invoice_id, thread_id,
+               subject, body, received_at,
+               ai_category, ai_summary, ai_promised_date, ai_confidence,
+               is_ptp, direction)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (gid, client_id, invoice_id, email.get("thread_id"),
+              subject[:400], body[:4000], email.get("date", ""),
+              None, None, None, 0.0, 0, "out"))
+        reply_id = cur.lastrowid
+        conn.commit()
+        return {"stored": True, "reply_id": reply_id, "direction": "out",
+                "invoice_id": invoice_id, "client_id": client_id}
+
+    # ── INBOUND (client reply) ───────────────────────────────────────────
+    sender  = (email.get("from") or "").strip().lower()
 
     client_id, invoice_id = _match_reply_to_invoice(conn, sender, subject, body)
 
@@ -509,16 +549,16 @@ def ingest_reply(conn, email: dict, today: date | None = None) -> dict:
         INSERT INTO client_replies
           (gmail_message_id, client_id, invoice_id, thread_id,
            subject, body, received_at,
-           ai_category, ai_summary, ai_promised_date, ai_confidence)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+           ai_category, ai_summary, ai_promised_date, ai_confidence, direction)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     """, (gid, client_id, invoice_id, email.get("thread_id"),
           subject[:400], body[:4000], email.get("date", ""),
           ai.get("category"), ai.get("summary"),
-          ai.get("promised_date"), float(ai.get("confidence") or 0)))
+          ai.get("promised_date"), float(ai.get("confidence") or 0), "in"))
     reply_id = cur.lastrowid
     conn.commit()
 
-    result = {"stored": True, "reply_id": reply_id,
+    result = {"stored": True, "reply_id": reply_id, "direction": "in",
               "category": ai.get("category"), "promised": ai.get("promised_date"),
               "invoice_id": invoice_id, "client_id": client_id}
 
@@ -527,71 +567,88 @@ def ingest_reply(conn, email: dict, today: date | None = None) -> dict:
     return result
 
 
-def _get_known_client_emails(min_reminders_sent: int = 1) -> list[str]:
-    """Return the list of client email addresses to whom we have already
-    dispatched at least one reminder. Only these are worth scanning for
-    replies — cuts Gmail traffic drastically vs 'entire inbox'."""
+def _all_client_emails() -> set[str]:
+    """Every client email we know about (lowercased), straight from the
+    `clients` table.
+
+    This REPLACES the old 'only clients we already app-emailed' universe,
+    which came from email_drafts.status='sent'. That list was empty on any
+    fresh DB (i.e. every ephemeral-cloud restart) and whenever reminders
+    were sent manually from Gmail — so the whole reply scan silently bailed
+    out. Matching against all known clients is what lets old/again-scanned
+    replies actually land."""
     with get_db(DB_PATH) as conn:
         rows = conn.execute("""
-            SELECT DISTINCT lower(c.email) AS email
-              FROM clients c
-              JOIN email_drafts d ON d.client_id = c.id
-             WHERE d.status = 'sent'
-               AND c.email IS NOT NULL
-               AND c.email != ''
+            SELECT DISTINCT lower(email) AS email
+              FROM clients
+             WHERE email IS NOT NULL AND email != ''
         """).fetchall()
-    return [r["email"] for r in rows if r["email"]]
+    return {r["email"] for r in rows if r["email"]}
 
 
-def _fetch_targeted(service, client_emails: list[str], days_back: int = None,
-                     max_results: int = 100, batch_size: int = 30) -> list[dict]:
-    """Custom Gmail query: only messages FROM known clients, only within
-    `days_back` days.  Batches the OR-list into chunks of `batch_size`
-    addresses so we don't blow Gmail's URL-length limit when many clients
-    have been reminded.
+_EMAIL_TOKEN_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
-    days_back defaults to env SCAN_DAYS_BACK (30) — was previously hardcoded
-    at 14, which caused older replies to be permanently invisible.
-    """
-    if days_back is None:
-        days_back = int(os.getenv("SCAN_DAYS_BACK", "30"))
-    if not client_emails:
-        return []
 
-    from services.gmail_client import _parse_message  # reuse existing parser
-    seen_ids: set[str] = set()
-    emails: list[dict] = []
+def _email_in_header(header: str, known: set[str]) -> str | None:
+    """Return the first known client email that appears as a full address in a
+    raw header (handles 'Name <a@b.com>' and comma-separated lists), else None.
+    Used to resolve the counterparty on SENT-box mail, where the client is the
+    recipient (To), not the sender. Matches whole email tokens — not substrings
+    — so e.g. 'on@corp.com' won't falsely match inside 'jon@corp.com'."""
+    if not header:
+        return None
+    for tok in _EMAIL_TOKEN_RE.findall(header.lower()):
+        if tok in known:
+            return tok
+    return None
 
-    # Batch to survive Gmail's URL length limit — 30 addresses per query
-    # is safe even with long enterprise addresses.
-    for i in range(0, len(client_emails), batch_size):
-        chunk = client_emails[i:i + batch_size]
-        from_clause = " OR ".join(f"from:{e}" for e in chunk)
-        q = f"({from_clause}) newer_than:{days_back}d"
 
+def _list_message_ids(service, query: str, cap: int = 500,
+                      page_size: int = 100) -> list[str]:
+    """Paginate Gmail's messages.list for `query`, returning up to `cap` ids.
+
+    The old code fetched only the first page (max 100), so anything past the
+    first page in the window was invisible — part of why 'older replies'
+    never showed up. We page through until we hit `cap` or run out."""
+    ids: list[str] = []
+    page_token = None
+    while len(ids) < cap:
         try:
-            result = service.users().messages().list(
-                userId="me", q=q, maxResults=max_results,
+            resp = service.users().messages().list(
+                userId="me", q=query,
+                maxResults=min(page_size, cap - len(ids)),
+                pageToken=page_token,
             ).execute()
         except Exception as e:
-            logger.warning("Gmail list failed for chunk %d–%d: %s",
-                            i, i + len(chunk), e)
-            continue
+            logger.warning("Gmail list failed for %r: %s", query, e)
+            break
+        ids.extend(m["id"] for m in resp.get("messages", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return ids
 
-        for ref in result.get("messages", []):
-            if ref["id"] in seen_ids:
-                continue
-            seen_ids.add(ref["id"])
-            try:
-                raw = service.users().messages().get(
-                    userId="me", id=ref["id"], format="full",
-                ).execute()
-                parsed = _parse_message(raw)
-                if parsed:
-                    emails.append(parsed)
-            except Exception:
-                continue
-    return emails
+
+def _fetch_mailbox(service, query: str, cap: int = 500) -> list[dict]:
+    """Fetch + parse every message matching `query` (up to `cap`). Deduped by
+    message id. Returns parsed dicts from the shared _parse_message()."""
+    from services.gmail_client import _parse_message  # reuse existing parser
+    out: list[dict] = []
+    seen: set[str] = set()
+    for mid in _list_message_ids(service, query, cap=cap):
+        if mid in seen:
+            continue
+        seen.add(mid)
+        try:
+            raw = service.users().messages().get(
+                userId="me", id=mid, format="full",
+            ).execute()
+            parsed = _parse_message(raw)
+            if parsed:
+                out.append(parsed)
+        except Exception:
+            continue
+    return out
 
 
 def _record_scan(result: dict) -> None:
@@ -631,50 +688,91 @@ def _record_scan(result: dict) -> None:
         conn.commit()
 
 
-def poll_gmail_replies(max_results: int = 100, days_back: int = None) -> dict:
-    """Fetch client replies from real Gmail.  Only messages FROM known
-    clients (i.e., clients we've actually emailed) are considered — this
-    prevents the whole-inbox scan that was making it slow.  Deduped by
-    gmail_message_id, so calling this every dashboard load is safe.
+def _is_invoice_related(subject: str, body: str) -> bool:
+    """True if the message references an invoice number — lets us catch a
+    genuine reply even when it arrives from an address we don't have on file."""
+    text = f"{subject or ''}\n{body or ''}"
+    return bool(INVOICE_NUM_RE.search(text))
 
-    Every run is persisted to `scan_history` so you can see the last N runs
-    on Tab 3.
+
+def poll_gmail_replies(max_results: int = 500, days_back: int = None) -> dict:
+    """Scan real Gmail for client replies (inbox) AND reminders we sent
+    (sent box), within the last `days_back` days.
+
+    WHAT CHANGED (v3.6)
+      • No longer gated on 'clients we already app-emailed'. The candidate
+        universe is EVERY known client (clients table), so a fresh/cloud DB
+        or manually-sent reminders no longer make the scan a no-op.
+      • Scans in:inbox AND in:sent, paginated through the whole window, so
+        older replies are pulled in — not just the first page.
+      • Relevance filter: a message is kept only if its counterparty is a
+        known client, OR it references an invoice number. Keeps newsletters
+        and unrelated mail out of client_replies / PTP analytics.
+      • Inbox → stored as inbound (direction='in') + AI extraction + PTP.
+        Sent  → stored as outbound (direction='out'), no PTP, for the
+                Tab-2 timeline.
+
+    Deduped by gmail_message_id, so calling it repeatedly is safe.
+    Every run is persisted to `scan_history` for Tab 3.
 
     Returns:
-        {fetched, processed, ptps, targeted_clients, days_back, error?}
+        {fetched, processed, inbound, outbound, ptps, targeted_clients,
+         days_back, error?}
     """
     if days_back is None:
         days_back = int(os.getenv("SCAN_DAYS_BACK", "30"))
 
-    known = _get_known_client_emails()
-    if not known:
-        result = {"fetched": 0, "processed": 0, "ptps": 0,
-                  "targeted_clients": 0, "days_back": days_back,
-                  "note": "No sent reminders yet — nothing to scan for."}
-        _record_scan(result)
-        return result
+    ensure_schema()
+    known = _all_client_emails()
 
     try:
         from services.gmail_client import get_gmail_service
         svc = get_gmail_service()
-        emails = _fetch_targeted(svc, known, days_back=days_back,
-                                  max_results=max_results)
+        inbox_msgs = _fetch_mailbox(svc, f"in:inbox newer_than:{days_back}d",
+                                    cap=max_results)
+        sent_msgs  = _fetch_mailbox(svc, f"in:sent newer_than:{days_back}d",
+                                    cap=max_results)
     except Exception as e:
-        result = {"fetched": 0, "processed": 0, "ptps": 0,
-                  "targeted_clients": len(known), "days_back": days_back,
-                  "error": str(e)}
+        result = {"fetched": 0, "processed": 0, "inbound": 0, "outbound": 0,
+                  "ptps": 0, "targeted_clients": len(known),
+                  "days_back": days_back, "error": str(e)}
         _record_scan(result)
         return result
 
-    stored = ptps = 0
+    fetched = len(inbox_msgs) + len(sent_msgs)
+    inbound = outbound = ptps = 0
+
     with get_db(DB_PATH) as conn:
-        for em in emails:
-            res = ingest_reply(conn, em)
+        # ── INBOX: potential client replies ──────────────────────────────
+        for em in inbox_msgs:
+            sender  = (em.get("from") or "").strip().lower()
+            subject = em.get("subject") or ""
+            body    = em.get("body") or ""
+            relevant = (sender in known) or _is_invoice_related(subject, body)
+            if not relevant:
+                continue
+            res = ingest_reply(conn, em, direction="in")
             if res.get("stored"):
-                stored += 1
+                inbound += 1
                 if res.get("ptp", {}).get("applied"):
                     ptps += 1
-    result = {"fetched": len(emails), "processed": stored, "ptps": ptps,
+
+        # ── SENT: reminders we dispatched (incl. manual ones) ────────────
+        for em in sent_msgs:
+            to_hdr  = em.get("to") or ""
+            subject = em.get("subject") or ""
+            body    = em.get("body") or ""
+            cp = _email_in_header(to_hdr, known)
+            relevant = bool(cp) or _is_invoice_related(subject, body)
+            if not relevant:
+                continue
+            res = ingest_reply(conn, em, direction="out", counterparty_email=cp)
+            if res.get("stored"):
+                outbound += 1
+
+    processed = inbound + outbound
+    result = {"fetched": fetched, "processed": processed,
+              "inbound": inbound, "outbound": outbound, "ptps": ptps,
               "targeted_clients": len(known), "days_back": days_back}
     _record_scan(result)
     return result
@@ -780,6 +878,24 @@ def ptp_summary() -> dict:
     }
 
 
+def _as_date(value) -> date | None:
+    """Lenient date parser for BOTH SQLite datetimes ('2026-08-05 10:30:00')
+    and RFC-2822 Gmail 'Date' headers ('Mon, 5 Aug 2026 10:30:00 +0530')."""
+    if not value:
+        return None
+    s = str(value).strip()
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(s)
+        return dt.date() if dt else None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=300)
 def client_communication_timeline(client_id: int) -> list[dict]:
     """Chat-style event list for a client: outbound drafts + inbound replies,
@@ -810,7 +926,7 @@ def client_communication_timeline(client_id: int) -> list[dict]:
         replies = conn.execute("""
             SELECT id, invoice_id, subject, body, received_at,
                    ai_category, ai_summary, ai_promised_date,
-                   ai_confidence, is_ptp
+                   ai_confidence, is_ptp, COALESCE(direction,'in') AS direction
               FROM client_replies
              WHERE client_id = ?
              ORDER BY received_at
@@ -825,6 +941,21 @@ def client_communication_timeline(client_id: int) -> list[dict]:
             "expected_payment_date": inv.get("expected_payment_date"),
         }
 
+    # App-sent reminder dates (for dedup against sent-box scans). A reminder
+    # sent THROUGH the app lives in email_drafts AND turns up in the Gmail
+    # sent box, so without this we'd show it twice.
+    app_sent_dates = [
+        _as_date(d["sent_at"] or d["created_at"])
+        for d in drafts if d["status"] == "sent"
+    ]
+    app_sent_dates = [d for d in app_sent_dates if d]
+
+    def _already_shown_as_draft(when) -> bool:
+        wd = _as_date(when)
+        if wd is None:
+            return False
+        return any(abs((wd - ad).days) <= 2 for ad in app_sent_dates)
+
     events = []
     for d in drafts:
         events.append({
@@ -837,6 +968,22 @@ def client_communication_timeline(client_id: int) -> list[dict]:
             **_inv_dates(d["invoice_id"]),
         })
     for r in replies:
+        if r["direction"] == "out":
+            # A reminder we sent, discovered in the Gmail sent box. Skip it if
+            # it's the same message an app-sent draft already represents.
+            if _already_shown_as_draft(r["received_at"]):
+                continue
+            events.append({
+                "kind":      "outbound",
+                "at":        r["received_at"],
+                "status":    "sent",
+                "subject":   r["subject"],
+                "template":  None,
+                "via":       "gmail",          # manually-sent, not via the app
+                "invoice_id": r["invoice_id"],
+                **_inv_dates(r["invoice_id"]),
+            })
+            continue
         events.append({
             "kind":       "inbound",
             "at":         r["received_at"],
@@ -861,7 +1008,8 @@ def client_ptp_kpis(client_id: int) -> dict:
             "SELECT COUNT(*) FROM email_drafts WHERE client_id=? AND status='sent'",
             (client_id,)).fetchone()[0]
         n_replies = conn.execute(
-            "SELECT COUNT(*) FROM client_replies WHERE client_id=?",
+            "SELECT COUNT(*) FROM client_replies "
+            "WHERE client_id=? AND COALESCE(direction,'in') <> 'out'",
             (client_id,)).fetchone()[0]
         n_ptps = conn.execute(
             "SELECT COUNT(*) FROM ptp_events WHERE client_id=?",
@@ -871,7 +1019,8 @@ def client_ptp_kpis(client_id: int) -> dict:
             (client_id,)).fetchone()[0]
         last = conn.execute("""
             SELECT ai_summary, ai_promised_date, received_at, is_ptp
-              FROM client_replies WHERE client_id=?
+              FROM client_replies
+             WHERE client_id=? AND COALESCE(direction,'in') <> 'out'
              ORDER BY received_at DESC LIMIT 1
         """, (client_id,)).fetchone()
     return {
