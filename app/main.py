@@ -11,6 +11,15 @@ import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+# --- Timezone: app data + users are IST. Streamlit Cloud runs UTC, so set this
+# before any datetime work (fixes stored created_at/sent_at timestamps; the
+# due-day math in core/database.py is already IST-explicit). Linux-only no-op.
+os.environ.setdefault("TZ", "Asia/Kolkata")
+try:
+    time.tzset()
+except Exception:
+    pass
+
 # --- Path setup: put the project root on sys.path so `from core...` works
 # whether you run this via `streamlit run app/main.py` or a container CMD.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +46,16 @@ try:
                 os.environ[_k] = str(_v)
 except Exception:
     pass   # local dev without any secrets file — that's fine
+
+# --- Restore databases from Google Drive (once per process) --------------
+# Streamlit Cloud wipes local disk on restart. Before anything opens
+# invoices.db / auth.db, pull the latest backup from Drive so the app starts
+# with real data. Guarded to run once; never blocks/crashes startup on failure.
+try:
+    from services.drive_sync import restore_on_start
+    restore_on_start()
+except Exception as _e:
+    print(f"Drive restore skipped: {_e}")
 
 # --- Optional sklearn (LR, IsolationForest, calibration, metrics) ----
 try:
