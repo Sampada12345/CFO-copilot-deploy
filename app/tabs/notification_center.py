@@ -478,6 +478,13 @@ def _run_send_worker(send_fn):
         _send_state["stopped_early"] = result["stopped_early"]
         _send_state["finished_at"]   = datetime.now()
 
+    # Reminders actually sent — back up to Drive now (critical write, push now).
+    try:
+        from services.drive_sync import request_backup
+        request_backup(force=True)
+    except Exception:
+        pass
+
 
 def _render_send_all_controls(send_fn):
     """Renders EITHER the Start button OR the Stop button + live progress,
