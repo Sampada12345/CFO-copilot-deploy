@@ -45,7 +45,13 @@ ENV VARS
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# India Standard Time — app data + users are IST. Streamlit Cloud runs UTC, so
+# datetime.now() there is ~5.5h behind; anchor all 'today' math to IST.
+IST = timezone(timedelta(hours=5, minutes=30))
+def _ist_today():
+    return datetime.now(IST).date()
 from typing import Optional
 
 DB_PATH = os.getenv("DB_PATH", "./invoices.db")
@@ -59,7 +65,7 @@ def _env_flag(name: str, default: str = "1") -> bool:
     return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off", "")
 
 
-USE_LIBSQL  = _env_flag("USE_LIBSQL", "1")
+USE_LIBSQL  = _env_flag("USE_LIBSQL", "0")  # Turso disabled — plain SQLite + Drive backup
 
 # NOTE: TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are read LAZILY (see _turso_url /
 # _turso_token below), NOT captured at import time. On Streamlit Cloud the
@@ -644,14 +650,14 @@ def get_invoices_needing_reminder(conn, days: int = 7) -> list:
     Excludes paid invoices, invoices with a pending/approved draft, and
     invoices with no client email. Handles messy AI date formats in Python.
     """
-    future = (datetime.now().date() + timedelta(days=days)).isoformat()  # noqa: F841
+    future = (_ist_today() + timedelta(days=days)).isoformat()  # noqa: F841
 
     rows = conn.execute("""
         SELECT
             i.*,
             c.name  AS client_name,
             c.email AS client_email,
-            CAST(julianday(i.due_date) - julianday('now') AS INTEGER) AS days_until_due
+            CAST(julianday(date(i.due_date)) - julianday(date('now','+330 minutes')) AS INTEGER) AS days_until_due
         FROM invoices i
         JOIN clients c ON c.id = i.client_id
         WHERE i.status IN ('unpaid', 'partial', 'overdue')
@@ -665,7 +671,7 @@ def get_invoices_needing_reminder(conn, days: int = 7) -> list:
         ORDER BY i.due_date ASC
     """).fetchall()
 
-    today     = datetime.now().date()
+    today     = _ist_today()
     future_dt = today + timedelta(days=days)
     result    = []
 
@@ -702,7 +708,7 @@ def get_all_invoices(conn) -> list:
             i.*,
             c.name  AS client_name,
             c.email AS client_email,
-            CAST(julianday(i.due_date) - julianday('now') AS INTEGER) AS days_until_due
+            CAST(julianday(date(i.due_date)) - julianday(date('now','+330 minutes')) AS INTEGER) AS days_until_due
         FROM invoices i
         JOIN clients c ON c.id = i.client_id
         ORDER BY
@@ -749,7 +755,7 @@ def get_pending_drafts(conn) -> list:
             i.total_amount,
             i.amount,
             i.currency,
-            CAST(julianday(i.due_date) - julianday('now') AS INTEGER) AS days_until_due
+            CAST(julianday(date(i.due_date)) - julianday(date('now','+330 minutes')) AS INTEGER) AS days_until_due
         FROM email_drafts d
         JOIN invoices i ON i.id = d.invoice_id
         JOIN clients  c ON c.id = d.client_id
@@ -829,7 +835,7 @@ def delete_push_subscription(conn, endpoint: str):
 
 def get_summary(conn) -> dict:
     """Get counts and totals for the dashboard header cards."""
-    today = datetime.now().date()
+    today = _ist_today()
     soon  = (today + timedelta(days=7)).isoformat()
     today = today.isoformat()
 
@@ -840,7 +846,7 @@ def get_summary(conn) -> dict:
         "total":              q("SELECT COUNT(*) FROM invoices"),
         "unpaid":             q("SELECT COUNT(*) FROM invoices WHERE status IN ('unpaid','partial')"),
         "paid":               q("SELECT COUNT(*) FROM invoices WHERE status='paid'"),
-        "overdue":            q("SELECT COUNT(*) FROM invoices WHERE status IN ('unpaid','partial','overdue') AND date(due_date) < date('now')"),
+        "overdue":            q("SELECT COUNT(*) FROM invoices WHERE status IN ('unpaid','partial','overdue') AND date(due_date) < date('now','+330 minutes')"),
         "due_soon":           q("SELECT COUNT(*) FROM invoices WHERE status IN ('unpaid','partial') AND date(due_date) BETWEEN date(?) AND date(?)", today, soon),
         "pending_drafts":     q("SELECT COUNT(*) FROM email_drafts WHERE status='pending'"),
         "total_outstanding":  q("SELECT COALESCE(SUM(COALESCE(total_amount,amount)),0) FROM invoices WHERE status IN ('unpaid','partial','overdue')"),
