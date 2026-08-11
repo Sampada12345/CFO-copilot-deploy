@@ -45,6 +45,11 @@ def _run_scan_bg(reason: str) -> None:
         try:
             from ai.ptp_intelligence import poll_gmail_replies
             result = poll_gmail_replies()
+            try:
+                from services.drive_sync import request_backup
+                request_backup()          # back up DBs after the scan writes
+            except Exception:
+                pass
             _STAMP.write_text(datetime.utcnow().isoformat())
             logger.info("Gmail scan (%s) done: %s", reason, result)
         except Exception as e:
