@@ -858,6 +858,15 @@ def poll_gmail_replies(max_results: int = 500, days_back: int = None) -> dict:
               "targeted_clients": len(known), "days_back": days_back,
               "incremental": incremental}
     _record_scan(result)
+
+    # Back up to Drive after EVERY scan. This lives here (not in the scheduler)
+    # so it fires no matter how the scan was triggered — the Tab-3 button, the
+    # scheduler, or the Windows Task runner all call this function.
+    try:
+        from services.drive_sync import request_backup
+        request_backup()
+    except Exception:
+        pass
     return result
 
 
