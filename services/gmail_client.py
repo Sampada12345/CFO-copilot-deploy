@@ -41,6 +41,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",        # send emails
     "https://www.googleapis.com/auth/gmail.labels",      # create labels
     "https://www.googleapis.com/auth/gmail.modify",      # apply labels to mark processed
+    "https://www.googleapis.com/auth/drive.file",        # backup DBs to Drive (only files THIS app creates)
 ]
 
 # ── How many days back to scan ────────────────────────────────
@@ -71,6 +72,41 @@ SEARCH_QUERY = (
 )
 
 PROCESSED_LABEL_NAME = "InvoiceAgent/Processed"
+
+
+def get_google_credentials():
+    """Load the shared Google OAuth credentials (Gmail + Drive) from
+    GMAIL_TOKEN_B64 (cloud) or the local token file, refreshing if expired.
+    Returns a Credentials object, or None if no token is available.
+
+    Both get_gmail_service() and services/drive_sync.py use this so Gmail and the
+    Drive backup share ONE login. For Drive to work the token must include the
+    drive.file scope — after adding it to SCOPES above, regenerate the token once.
+    """
+    import base64
+    from google.auth.transport.requests import Request
+
+    creds = None
+    token_b64 = os.getenv("GMAIL_TOKEN_B64", "").strip()
+    if token_b64:
+        try:
+            creds = pickle.loads(base64.b64decode(token_b64))
+        except Exception as e:
+            print(f"⚠ Could not load GMAIL_TOKEN_B64: {e}")
+            creds = None
+    if creds is None and Path(TOKEN_FILE).exists():
+        with open(TOKEN_FILE, "rb") as f:
+            creds = pickle.load(f)
+
+    if creds and not creds.valid and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        if not token_b64:                       # persist refreshed token locally
+            try:
+                with open(TOKEN_FILE, "wb") as f:
+                    pickle.dump(creds, f)
+            except Exception:
+                pass
+    return creds
 
 
 def get_gmail_service():
