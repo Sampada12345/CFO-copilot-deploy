@@ -25,6 +25,7 @@ tzlocal>=5.0
 # ── Env + HTTP ──────────────────────────────────────────────────────────
 python-dotenv>=1.0
 requests>=2.31
+psycopg[binary,pool]>=3.1
 
 # ── Google API (Gmail agent) ────────────────────────────────────────────
 google-auth>=2.29

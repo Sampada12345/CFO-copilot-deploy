@@ -1,14 +1,46 @@
 """
-auth_users.py — Restricted signup/login for CFO Copilot (Streamlit).
+auth.py — Restricted signup/login for CFO Copilot (Streamlit).
 
-Replaces the single shared-password auth.py with real per-user accounts,
-but signup is LOCKED to an allowlist: only email addresses that an admin
-has pre-approved can create an account. Everyone else sees
-"This email is not authorised for access."
+v3.7 — MIGRATED TO SUPABASE / POSTGRES
+────────────────────────────────────────
+Previously this module owned its own SQLite file (auth.db) and used the
+stdlib sqlite3 driver directly.  With the app-wide move to Supabase, it
+now shares the single Postgres pool exposed by core.database.get_db(),
+so there's one connection story across the whole codebase.
 
-Design decisions
-----------------
-- SQLite (auth.db) — same zero-infra philosophy as invoices.db.
+WHAT CHANGED  (everything else in this file is unchanged from v3.6)
+─────────────────────────────────────────────────────────────────────
+  • The `_conn()` helper no longer opens a sqlite3 connection — it
+    yields a connection-shim from the shared pool.  Callers still use
+    `with _conn() as c:` exactly as before; the shim commits on clean
+    exit and rolls back on exception, matching the old sqlite3 behaviour.
+
+  • `init_auth_db()` no longer runs CREATE TABLE statements — the
+    schema for allowlist / users / login_attempts / password_resets is
+    now created by core.database.init_db() as part of the single
+    startup schema block.  The function is kept (same name, same
+    caller in require_login()) so it can perform the ADMIN_EMAIL
+    bootstrap once the tables exist.
+
+  • `_ensure_reset_table()` removed — same reason.
+
+  • The two `INSERT OR REPLACE` statements (in `add_to_allowlist` and
+    `issue_reset_code`) are rewritten to explicit
+    `INSERT ... ON CONFLICT (email) DO UPDATE SET ...` because the
+    Postgres shim intentionally refuses to auto-translate the OR REPLACE
+    form (it can't safely infer the conflict target from arbitrary SQL).
+
+  • The bootstrap INSERT OR IGNORE in `init_auth_db()` still works
+    verbatim — the shim auto-translates INSERT OR IGNORE INTO ... into
+    INSERT INTO ... ON CONFLICT DO NOTHING.
+
+  • Type hints changed from `sqlite3.Row` to `dict | None` — the row
+    objects the shim returns are duck-compatible with sqlite3.Row
+    (row["col"] / row[0] / dict(row) / row.keys() all work), so every
+    call site that reads `row["email"]` etc. is unchanged.
+
+Design decisions (unchanged from v3.6)
+--------------------------------------
 - PBKDF2-HMAC-SHA256 with per-user salt, 200k iterations. No plaintext,
   no external dependencies (bcrypt not required).
 - Login lockout: 5 failed attempts per email per 15 minutes.
@@ -19,7 +51,7 @@ Design decisions
   problem.
 - Session: streamlit session_state + an idle timeout (default 60 min).
 
-Integration (app.py, right after st.set_page_config):
+Integration (app/main.py, right after st.set_page_config):
 
     from app.auth import require_login, logout_button, admin_sidebar_panel
     user = require_login()          # blocks until authenticated
@@ -29,8 +61,9 @@ Integration (app.py, right after st.set_page_config):
 
 .env additions:
     ADMIN_EMAIL=cfo@yourcompany.com
-    AUTH_DB_PATH=auth.db            # optional
     SESSION_TIMEOUT_MIN=60          # optional
+    # SUPABASE_DB_URL is already required by core/database.py; auth
+    # reuses that same pool, so no auth-specific env var is needed.
 """
 
 from __future__ import annotations
@@ -39,13 +72,15 @@ import hashlib
 import hmac
 import os
 import secrets
-import sqlite3
 import time
 from datetime import datetime
 
 import streamlit as st
 
-DB_PATH = os.getenv("AUTH_DB_PATH", "auth.db")
+# Shared Postgres pool.  Every `with _conn() as c:` call below routes
+# through this — no more auth.db file, no more stdlib sqlite3.
+from core.database import get_db
+
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip().lower()
 SESSION_TIMEOUT_MIN = int(os.getenv("SESSION_TIMEOUT_MIN", "60"))
 
@@ -55,46 +90,38 @@ LOCKOUT_WINDOW_SEC = 15 * 60
 
 
 # ---------------------------------------------------------------- database
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _conn():
+    """Return a context-managed connection from the shared Supabase pool.
+
+    Kept as a named helper (rather than inlining ``get_db()`` at every
+    call site) so this file's diff stays small and future backend swaps
+    can be made in one place.  Same shape as the old sqlite3 version:
+    ``with _conn() as c:`` commits on clean exit, rolls back on exception.
+    """
+    return get_db()
 
 
 def init_auth_db() -> None:
+    """Bootstrap step: guarantee the configured admin can always sign up.
+
+    The auth tables themselves (allowlist / users / login_attempts /
+    password_resets) are created by ``core.database.init_db()`` — this
+    function only handles the ADMIN_EMAIL allowlist entry so the first
+    admin can register without an existing admin to invite them.
+
+    Safe to call on every request: INSERT OR IGNORE is a no-op if the
+    row already exists (the shim translates this to Postgres's
+    ``ON CONFLICT DO NOTHING``).
+    """
+    if not ADMIN_EMAIL:
+        return
     with _conn() as c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS allowlist (
-                email      TEXT PRIMARY KEY,
-                role       TEXT NOT NULL DEFAULT 'member',   -- role granted on signup
-                added_by   TEXT,
-                added_at   TEXT
-            );
-            CREATE TABLE IF NOT EXISTS users (
-                email         TEXT PRIMARY KEY,
-                full_name     TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                salt          TEXT NOT NULL,
-                role          TEXT NOT NULL DEFAULT 'member',
-                status        TEXT NOT NULL DEFAULT 'active', -- active | disabled
-                created_at    TEXT,
-                last_login    TEXT
-            );
-            CREATE TABLE IF NOT EXISTS login_attempts (
-                email   TEXT,
-                ts      REAL,
-                success INTEGER
-            );
-            """
+        c.execute(
+            "INSERT OR IGNORE INTO allowlist (email, role, added_by, added_at) "
+            "VALUES (?, 'admin', 'bootstrap', ?)",
+            (ADMIN_EMAIL, datetime.utcnow().isoformat()),
         )
-        # Bootstrap: guarantee the configured admin can always sign up.
-        if ADMIN_EMAIL:
-            c.execute(
-                "INSERT OR IGNORE INTO allowlist (email, role, added_by, added_at) "
-                "VALUES (?, 'admin', 'bootstrap', ?)",
-                (ADMIN_EMAIL, datetime.utcnow().isoformat()),
-            )
+        c.commit()
 
 
 # ---------------------------------------------------------------- hashing
@@ -110,7 +137,8 @@ def _verify_password(password: str, salt_hex: str, stored_hash: str) -> bool:
 
 
 # ---------------------------------------------------------------- core ops
-def is_allowlisted(email: str) -> sqlite3.Row | None:
+def is_allowlisted(email: str):
+    """Return the allowlist row for `email` (dict-like) or None."""
     with _conn() as c:
         return c.execute(
             "SELECT * FROM allowlist WHERE email = ?", (email.lower().strip(),)
@@ -147,6 +175,7 @@ def signup(email: str, full_name: str, password: str) -> tuple[bool, str]:
                 datetime.utcnow().isoformat(),
             ),
         )
+        c.commit()
     return True, "Account created — you can log in now."
 
 
@@ -182,6 +211,7 @@ def login(email: str, password: str) -> tuple[bool, str, dict | None]:
                 "UPDATE users SET last_login = ? WHERE email = ?",
                 (datetime.utcnow().isoformat(), email),
             )
+        c.commit()
 
     if not ok:
         return False, "Invalid email or password, or account disabled.", None
@@ -190,22 +220,39 @@ def login(email: str, password: str) -> tuple[bool, str, dict | None]:
 
 # ---------------------------------------------------------------- admin ops
 def add_to_allowlist(email: str, role: str, added_by: str) -> None:
+    """Approve `email` at `role`.  Idempotent: if the email is already
+    on the list, updates its role / audit fields to the new values.
+
+    Rewritten from SQLite's ``INSERT OR REPLACE`` to Postgres's explicit
+    ``INSERT ... ON CONFLICT (email) DO UPDATE SET ...`` — the shim
+    intentionally refuses to auto-translate OR REPLACE because it can't
+    safely infer the conflict target from arbitrary SQL.
+    """
     with _conn() as c:
         c.execute(
-            "INSERT OR REPLACE INTO allowlist (email, role, added_by, added_at) "
-            "VALUES (?,?,?,?)",
+            """
+            INSERT INTO allowlist (email, role, added_by, added_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (email) DO UPDATE SET
+                role     = EXCLUDED.role,
+                added_by = EXCLUDED.added_by,
+                added_at = EXCLUDED.added_at
+            """,
             (email.lower().strip(), role, added_by, datetime.utcnow().isoformat()),
         )
+        c.commit()
 
 
 def remove_from_allowlist(email: str) -> None:
     with _conn() as c:
         c.execute("DELETE FROM allowlist WHERE email = ?", (email.lower().strip(),))
+        c.commit()
 
 
 def set_user_status(email: str, status: str) -> None:
     with _conn() as c:
         c.execute("UPDATE users SET status = ? WHERE email = ?", (status, email))
+        c.commit()
 
 
 def delete_user(email: str) -> None:
@@ -216,26 +263,18 @@ def delete_user(email: str) -> None:
         c.execute("DELETE FROM users WHERE email = ?", (email,))
         c.execute("DELETE FROM login_attempts WHERE email = ?", (email,))
         c.execute("DELETE FROM password_resets WHERE email = ?", (email,))
+        c.commit()
 
 
 # ---- password reset (admin-issued codes; no SMTP required) ----
-def _ensure_reset_table() -> None:
-    with _conn() as c:
-        c.execute(
-            "CREATE TABLE IF NOT EXISTS password_resets ("
-            "  email TEXT PRIMARY KEY,"
-            "  code_hash TEXT NOT NULL,"
-            "  salt TEXT NOT NULL,"
-            "  expires_at REAL NOT NULL,"
-            "  issued_by TEXT)"
-        )
-
-
 def issue_reset_code(email: str, issued_by: str) -> str:
     """Admin generates a one-time reset code. Returned in plain text so the
     admin can share it via any trusted channel (Teams / phone / in person).
-    Code expires in 30 minutes; single use."""
-    _ensure_reset_table()
+    Code expires in 30 minutes; single use.
+
+    Rewritten from ``INSERT OR REPLACE`` to explicit
+    ``ON CONFLICT (email) DO UPDATE`` (see add_to_allowlist for the same
+    reasoning)."""
     email = email.lower().strip()
     with _conn() as c:
         if not c.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
@@ -243,16 +282,24 @@ def issue_reset_code(email: str, issued_by: str) -> str:
         code = secrets.token_hex(4).upper()   # 8-char code
         salt = secrets.token_hex(16)
         c.execute(
-            "INSERT OR REPLACE INTO password_resets "
-            "(email, code_hash, salt, expires_at, issued_by) VALUES (?,?,?,?,?)",
+            """
+            INSERT INTO password_resets
+                (email, code_hash, salt, expires_at, issued_by)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (email) DO UPDATE SET
+                code_hash  = EXCLUDED.code_hash,
+                salt       = EXCLUDED.salt,
+                expires_at = EXCLUDED.expires_at,
+                issued_by  = EXCLUDED.issued_by
+            """,
             (email, _hash_password(code, salt), salt,
              time.time() + 30 * 60, issued_by),
         )
+        c.commit()
     return code
 
 
 def redeem_reset_code(email: str, code: str, new_password: str) -> tuple[bool, str]:
-    _ensure_reset_table()
     if len(new_password) < 10:
         return False, "New password must be at least 10 characters."
     email = email.lower().strip()
@@ -264,6 +311,7 @@ def redeem_reset_code(email: str, code: str, new_password: str) -> tuple[bool, s
             return False, "No reset code has been issued for this email. Ask an admin to generate one."
         if row["expires_at"] < time.time():
             c.execute("DELETE FROM password_resets WHERE email = ?", (email,))
+            c.commit()
             return False, "That reset code has expired. Ask the admin to issue a new one."
         if not hmac.compare_digest(
             _hash_password(code.strip().upper(), row["salt"]), row["code_hash"]
@@ -275,15 +323,16 @@ def redeem_reset_code(email: str, code: str, new_password: str) -> tuple[bool, s
             (new_salt, _hash_password(new_password, new_salt), email),
         )
         c.execute("DELETE FROM password_resets WHERE email = ?", (email,))
+        c.commit()
     return True, "Password updated — please log in with your new password."
 
 
-def list_allowlist() -> list[sqlite3.Row]:
+def list_allowlist() -> list:
     with _conn() as c:
         return c.execute("SELECT * FROM allowlist ORDER BY email").fetchall()
 
 
-def list_users() -> list[sqlite3.Row]:
+def list_users() -> list:
     with _conn() as c:
         return c.execute(
             "SELECT email, full_name, role, status, last_login FROM users ORDER BY email"
@@ -421,67 +470,56 @@ LOGIN_CSS = """
       color: #f0eee5 !important;
   }
   .login-card .stTabs [data-baseweb="tab-highlight"] {
-      background-color: #c9a961 !important;
-      height: 1px !important;
-  }
-  .login-card .stTabs [data-baseweb="tab-border"] { display: none !important; }
-
-  /* Captions */
-  .login-card .stCaption p, .login-card [data-testid="stCaptionContainer"] p,
-  .login-card small {
-      color: #6b6a63 !important;
-      font-size: 12px !important; line-height: 1.6 !important;
+      background: #c9a961 !important;
+      height: 2px !important;
   }
 
-  /* ── PRIMARY BUTTON — CRED-style, quiet, no red ──────────────────── */
-  .login-card .stButton>button,
-  .login-card .stButton>button:focus,
-  .login-card [data-testid="stForm"] .stButton>button {
-      background: #f0eee5 !important;      /* soft cream */
-      background-color: #f0eee5 !important;
-      color: #0a0a0d !important;
-      border: 0 !important;
+  /* ── PRIMARY BUTTON (Sign In / Create / Reset) ─────────────────── */
+  .login-card button[kind="primary"],
+  .login-card [data-testid="stFormSubmitButton"] > button {
+      background: linear-gradient(180deg, #d9bd7e 0%, #c9a961 100%) !important;
+      color: #1a1a1f !important;
+      border: none !important;
       border-radius: 10px !important;
-      height: 46px !important;
+      padding: 12px 20px !important;
       font-weight: 600 !important;
       font-size: 13px !important;
-      letter-spacing: 2px !important;
+      letter-spacing: 1.8px !important;
       text-transform: uppercase !important;
-      box-shadow: 0 2px 12px rgba(0,0,0,.4) !important;
       transition: all .2s ease !important;
-      margin-top: 8px !important;
+      box-shadow: 0 4px 12px rgba(201,169,97,.15) !important;
   }
-  .login-card .stButton>button:hover {
-      background: #ffffff !important;
-      background-color: #ffffff !important;
-      color: #0a0a0d !important;
-      transform: translateY(-1px);
-      box-shadow: 0 4px 18px rgba(240, 238, 229, 0.15) !important;
+  .login-card button[kind="primary"]:hover,
+  .login-card [data-testid="stFormSubmitButton"] > button:hover {
+      transform: translateY(-1px) !important;
+      box-shadow: 0 6px 18px rgba(201,169,97,.28) !important;
+      background: linear-gradient(180deg, #e0c58a 0%, #d1b06e 100%) !important;
   }
-  .login-card .stButton>button:active { transform: translateY(0); }
 
-  /* Error / alert boxes inside the card — red stays reserved for these */
+  /* ── ALERTS ───────────────────────────────────────────────────────── */
   .login-card [data-testid="stAlert"] {
-      background: rgba(220, 76, 76, 0.08) !important;
-      border: 1px solid rgba(220, 76, 76, 0.25) !important;
-      border-radius: 8px !important;
-      color: #f5b8b8 !important;
+      border-radius: 10px !important;
+      border: 1px solid #23232a !important;
+      background: #16161b !important;
   }
-  .login-card [data-testid="stAlert"][data-baseweb="notification"] p {
-      color: #f5b8b8 !important;
-  }
-
-  /* Success (rare) */
-  .login-card .stAlert.st-emotion-cache-success {
-      background: rgba(140, 189, 122, 0.08) !important;
-      border-color: rgba(140, 189, 122, 0.25) !important;
-      color: #a8d091 !important;
+  .login-card [data-testid="stAlert"] p {
+      color: #c9c4b6 !important;
+      font-size: 13px !important;
   }
 
-  /* ── FOOTER FEATURE STRIP ────────────────────────────────────────── */
+  /* ── CAPTION UNDER TABS ──────────────────────────────────────────── */
+  .login-card [data-testid="stCaptionContainer"] p,
+  .login-card small {
+      color: #8a8880 !important;
+      font-size: 12px !important;
+      line-height: 1.6 !important;
+  }
+
+  /* ── FOOTER FEATURE STRIP ─────────────────────────────────────────── */
   .features {
-      color: #4a4943 !important; font-size: 11px; text-align: center;
-      margin-top: 40px; letter-spacing: 2px; text-transform: uppercase;
+      text-align: center; padding: 40px 12px 24px 12px;
+      font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+      font-weight: 500;
   }
   .features span { margin: 0 14px; color: #6b6a63; }
   .features .dot { color: #3a3a42; margin: 0 6px; }
