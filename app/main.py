@@ -87,7 +87,9 @@ from app.tabs.client_profiles import render_tab2
 # Page config + styles
 # ============================================================
 st.set_page_config(page_title="CFO Copilot | Finance & Collections", layout="wide")
-
+from app.theme import inject_theme, render_topbar
+inject_theme()
+render_topbar()
 # ============================================================
 # ACCESS CONTROL (v3) — allowlist-restricted signup/login.
 # Nothing below this block renders for anonymous visitors:
@@ -163,9 +165,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("Finance & Collections Copilot")
-st.caption("SAP Connected • AI-Driven Receivables Agent")
-st.write("---")
 
 
 # ============================================================
