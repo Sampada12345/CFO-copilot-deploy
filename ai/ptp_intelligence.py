@@ -735,36 +735,6 @@ def _is_invoice_related(subject: str, body: str) -> bool:
     return bool(INVOICE_NUM_RE.search(text))
 
 
-# ── Incremental-scan watermark ─────────────────────────────────────────────
-# The scan used to re-read the whole window every run. We now remember the epoch
-# of the last successful scan and only ask Gmail for mail AFTER it, so each run
-# processes just new messages. Dedup by gmail_message_id makes overlap harmless.
-
-def _get_scan_watermark():
-    try:
-        with get_db(DB_PATH) as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS scan_state "
-                         "(key TEXT PRIMARY KEY, value TEXT)")
-            row = conn.execute(
-                "SELECT value FROM scan_state WHERE key='last_scan_epoch'").fetchone()
-        return int(row["value"]) if row and row["value"] else None
-    except Exception:
-        return None
-
-
-def _set_scan_watermark(epoch: int) -> None:
-    try:
-        with get_db(DB_PATH) as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS scan_state "
-                         "(key TEXT PRIMARY KEY, value TEXT)")
-            conn.execute(
-                "INSERT INTO scan_state (key, value) VALUES ('last_scan_epoch', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(epoch),))
-            conn.commit()
-    except Exception:
-        pass
-
-
 def poll_gmail_replies(max_results: int = 500, days_back: int = None) -> dict:
     """Scan real Gmail for client replies (inbox) AND reminders we sent
     (sent box), within the last `days_back` days.
@@ -795,26 +765,17 @@ def poll_gmail_replies(max_results: int = 500, days_back: int = None) -> dict:
     ensure_schema()
     known = _all_client_emails()
 
-    # Incremental: only pull mail newer than the last successful scan.
-    run_epoch = int(datetime.now().timestamp())
-    watermark = _get_scan_watermark()
-    if watermark:
-        after = watermark - 86400          # 1-day overlap; dedup absorbs it
-        q_inbox, q_sent, incremental = f"in:inbox after:{after}", f"in:sent after:{after}", True
-    else:
-        q_inbox = f"in:inbox newer_than:{days_back}d"
-        q_sent  = f"in:sent newer_than:{days_back}d"
-        incremental = False
-
     try:
         from services.gmail_client import get_gmail_service
         svc = get_gmail_service()
-        inbox_msgs = _fetch_mailbox(svc, q_inbox, cap=max_results)
-        sent_msgs  = _fetch_mailbox(svc, q_sent,  cap=max_results)
+        inbox_msgs = _fetch_mailbox(svc, f"in:inbox newer_than:{days_back}d",
+                                    cap=max_results)
+        sent_msgs  = _fetch_mailbox(svc, f"in:sent newer_than:{days_back}d",
+                                    cap=max_results)
     except Exception as e:
         result = {"fetched": 0, "processed": 0, "inbound": 0, "outbound": 0,
-                  "ptps": 0, "targeted_clients": len(known), "days_back": days_back,
-                  "incremental": incremental, "error": str(e)}
+                  "ptps": 0, "targeted_clients": len(known),
+                  "days_back": days_back, "error": str(e)}
         _record_scan(result)
         return result
 
@@ -849,24 +810,11 @@ def poll_gmail_replies(max_results: int = 500, days_back: int = None) -> dict:
             if res.get("stored"):
                 outbound += 1
 
-    # advance the watermark only on a clean run (never skip mail after a failure)
-    _set_scan_watermark(run_epoch)
-
     processed = inbound + outbound
     result = {"fetched": fetched, "processed": processed,
               "inbound": inbound, "outbound": outbound, "ptps": ptps,
-              "targeted_clients": len(known), "days_back": days_back,
-              "incremental": incremental}
+              "targeted_clients": len(known), "days_back": days_back}
     _record_scan(result)
-
-    # Back up to Drive after EVERY scan. This lives here (not in the scheduler)
-    # so it fires no matter how the scan was triggered — the Tab-3 button, the
-    # scheduler, or the Windows Task runner all call this function.
-    try:
-        from services.drive_sync import request_backup
-        request_backup()
-    except Exception:
-        pass
     return result
 
 
@@ -950,15 +898,15 @@ def ptp_summary() -> dict:
                    AVG(p.days_extended) AS avg_days
               FROM ptp_events p
               JOIN clients c ON c.id = p.client_id
-             GROUP BY p.client_id
+             GROUP BY p.client_id, c.name
              ORDER BY total_days_extended DESC
              LIMIT 10
         """).fetchall()
         repeat_offenders = conn.execute("""
             SELECT COUNT(DISTINCT client_id) FROM (
                 SELECT client_id, COUNT(*) AS n
-                  FROM ptp_events GROUP BY client_id HAVING n >= 3
-            )
+                  FROM ptp_events GROUP BY client_id HAVING COUNT(*) >= 3
+            ) sub
         """).fetchone()[0]
 
     return {
